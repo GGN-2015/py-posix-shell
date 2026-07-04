@@ -35,6 +35,7 @@ from .parser import (
     SubshellCommand,
     parse,
 )
+from .posix_utils import INTERNAL_UTILITIES
 
 
 @dataclass
@@ -412,6 +413,12 @@ class Shell:
                 capture_stdout=capture_stdout,
                 in_pipeline=in_pipeline,
             )
+        if self.should_run_internal_utility(name, dict(self.env, **expanded.assignments)):
+            return self.run_internal_utility_command(
+                expanded,
+                pipeline_input=pipeline_input,
+                capture_stdout=capture_stdout,
+            )
         return self.run_external_command(
             expanded,
             pipeline_input=pipeline_input,
@@ -540,6 +547,38 @@ class Shell:
 
         return status, stdout_buffer.getvalue() if stdout_buffer is not None else ""
 
+    def run_internal_utility_command(
+        self,
+        expanded: ExpandedCommand,
+        *,
+        pipeline_input: str | None,
+        capture_stdout: bool,
+    ) -> tuple[int, str]:
+        name = expanded.argv[0]
+        stdin = io.StringIO(pipeline_input) if pipeline_input is not None else self.stdin
+        stdout_buffer = io.StringIO() if capture_stdout else None
+        stdout = stdout_buffer if stdout_buffer is not None else self.stdout
+        restore_env: dict[str, tuple[bool, str]] = {}
+
+        for var_name, value in expanded.assignments.items():
+            restore_env[var_name] = (var_name in self.env, self.env.get(var_name, ""))
+            self.env[var_name] = value
+
+        try:
+            with self.redirected(expanded.redirections, stdin, stdout, self.stderr) as streams:
+                status = INTERNAL_UTILITIES[name](self, expanded.argv, streams[0], streams[1], streams[2])
+        except OSError as exc:
+            self.stderr.write(f"{self.argv0}: {exc}\n")
+            status = 1
+        finally:
+            for var_name, (was_set, old_value) in restore_env.items():
+                if was_set:
+                    self.env[var_name] = old_value
+                else:
+                    self.env.pop(var_name, None)
+
+        return status, stdout_buffer.getvalue() if stdout_buffer is not None else ""
+
     def run_function_command(
         self,
         name: str,
@@ -600,6 +639,12 @@ class Shell:
     ) -> tuple[int, str]:
         env = dict(self.env)
         env.update(expanded.assignments)
+        if self.should_run_internal_utility(expanded.argv[0], env):
+            return self.run_internal_utility_command(
+                expanded,
+                pipeline_input=pipeline_input,
+                capture_stdout=capture_stdout,
+            )
         stdout_redirected = any(fd == 1 for fd, _op, _target in expanded.redirections)
         effective_capture = capture_stdout and not stdout_redirected
         try:
@@ -632,6 +677,14 @@ class Shell:
         if not argv:
             return 0
         env = dict(self.env if env is None else env)
+        if self.should_run_internal_utility(argv[0], env):
+            return INTERNAL_UTILITIES[argv[0]](
+                self,
+                argv,
+                stdin if stdin is not None else self.stdin,
+                stdout if stdout is not None else self.stdout,
+                stderr if stderr is not None else self.stderr,
+            )
         executable = self.resolve_command(argv[0], env)
         if executable is None:
             (stderr or self.stderr).write(f"{argv[0]}: command not found\n")
@@ -848,8 +901,16 @@ class Shell:
     def is_builtin(self, name: str) -> bool:
         return name in BUILTINS
 
+    def is_internal_utility(self, name: str) -> bool:
+        return name in INTERNAL_UTILITIES
+
     def which(self, name: str) -> str | None:
-        return self.resolve_command(name, self.env)
+        path = self.resolve_command(name, self.env)
+        if path:
+            return path
+        if name in INTERNAL_UTILITIES:
+            return name
+        return None
 
     def resolve_command(self, name: str, env: dict[str, str]) -> str | None:
         if any(sep in name for sep in ("/", "\\")):
@@ -857,6 +918,11 @@ class Shell:
         if name in self.command_hash and os.path.exists(self.command_hash[name]):
             return self.command_hash[name]
         return shutil.which(name, path=env.get("PATH"))
+
+    def should_run_internal_utility(self, name: str, env: dict[str, str]) -> bool:
+        if name not in INTERNAL_UTILITIES:
+            return False
+        return self.resolve_command(name, env) is None
 
     def run_exit_trap(self) -> None:
         action = self.traps.get("EXIT") or self.traps.get("0")

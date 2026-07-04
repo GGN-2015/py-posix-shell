@@ -28,6 +28,14 @@ scripts:
   `exec`, `exit`, `export`, `readonly`, `unset`, `set`, `shift`, `getopts`,
   `echo`, `printf`, `read`, `type`, `command`, `env`, `test`, `[`, `trap`,
   `umask`, `times`, and `hash`
+- internal POSIX/GNU-style utility fallbacks for hosts such as Windows where
+  commands may be missing. The shell prefers a native command when it exists and
+  otherwise falls back to Python implementations of common tools including
+  `ls`, `cat`, `cp`, `mv`, `rm`, `install`, `unlink`, `mkdir`, `rmdir`, `pwd`,
+  `sort`, `uniq`, `wc`, `cut`, `head`, `tail`, `chmod`, `chown`, `chgrp`,
+  `echo`, `date`, `sleep`, `printf`, `basename`, `dirname`, `whoami`, `yes`,
+  `find`, `xargs`, `locate`, `updatedb`, `diff`, `cmp`, `diff3`, `sdiff`,
+  `grep`, `egrep`, `fgrep`, `sed`, `awk`, `gawk`, and `tar`
 
 The implementation intentionally remains dependency-free at runtime. It aims for
 useful POSIX behavior first, then progressively tighter compatibility with

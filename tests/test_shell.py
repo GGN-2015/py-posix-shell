@@ -282,3 +282,150 @@ locked=two
     assert status == 2
     assert stdout == ""
     assert "locked: is read only" in stderr
+
+
+def test_internal_posix_utilities_work_without_path(tmp_path):
+    env = {"PATH": ""}
+    src = tmp_path / "src.txt"
+    dst = tmp_path / "dst.txt"
+    moved = tmp_path / "moved.txt"
+    nested = tmp_path / "a" / "b"
+    src.write_text("alpha\nbeta\nalpha-two\n", encoding="utf-8")
+    script = f'''
+mkdir -p "{nested}"
+cp "{src}" "{dst}"
+mv "{dst}" "{moved}"
+printf "extra\\n" >> "{moved}"
+ls -1 "{tmp_path}"
+cat "{moved}" | grep alpha | wc -l
+head -n 1 "{moved}"
+tail -n 1 "{moved}"
+touch "{tmp_path / 'new.txt'}"
+rm "{tmp_path / 'new.txt'}"
+rmdir "{nested}"
+rmdir "{nested.parent}"
+basename "{moved}"
+dirname "{moved}"
+'''
+    status, stdout, stderr, _shell = run_shell(script, env=env)
+    assert status == 0
+    assert "moved.txt" in stdout
+    assert "\n2\n" in stdout
+    assert "alpha\n" in stdout
+    assert "extra\n" in stdout
+    assert "moved.txt\n" in stdout
+    assert str(tmp_path) in stdout
+    assert not (tmp_path / "new.txt").exists()
+    assert not nested.parent.exists()
+    assert stderr == ""
+
+
+def test_internal_process_and_identity_utilities_without_path():
+    status, stdout, stderr, _shell = run_shell(
+        "ps; uname -s; whoami; id; date +%Y",
+        env={"PATH": ""},
+    )
+    assert status == 0
+    assert "PID COMMAND\n" in stdout
+    assert stdout.count("\n") >= 5
+    assert stderr == ""
+
+
+def test_command_and_type_report_internal_utility_when_path_is_empty():
+    status, stdout, stderr, _shell = run_shell("command -v ls; type ls", env={"PATH": ""})
+    assert status == 0
+    assert stdout.splitlines()[0] == "ls"
+    assert "ls is a shell utility" in stdout
+    assert stderr == ""
+
+
+def test_internal_extended_text_utilities_without_path(tmp_path):
+    data = tmp_path / "data.txt"
+    csv = tmp_path / "data.csv"
+    data.write_text("beta\nalpha\nalpha\ngamma\n", encoding="utf-8")
+    csv.write_text("1,red\n2,blue\n", encoding="utf-8")
+    script = f'''
+sort "{data}" | uniq
+sort -r "{data}" | head -n 1
+cut -d, -f2 "{csv}"
+grep -c alpha "{data}"
+egrep "alpha|gamma" "{data}" | wc -l
+fgrep "a.b" "{data}"
+echo fixed-miss:$?
+sed -n "s/alpha/ALPHA/p" "{data}"
+gawk -F, '{{ print $2 }}' "{csv}"
+yes ok | head -n 2
+'''
+    status, stdout, stderr, _shell = run_shell(script, env={"PATH": ""})
+    assert status == 0
+    assert "alpha\nbeta\ngamma\n" in stdout
+    assert "gamma\n" in stdout
+    assert "red\nblue\n" in stdout
+    assert "\n2\n" in stdout
+    assert "fixed-miss:1\n" in stdout
+    assert "ALPHA\nALPHA\n" in stdout
+    assert stdout.endswith("ok\nok\n")
+    assert stderr == ""
+
+
+def test_internal_findutils_and_file_install_without_path(tmp_path):
+    source = tmp_path / "source.txt"
+    source.write_text("payload\n", encoding="utf-8")
+    installed = tmp_path / "dest" / "bin" / "source.txt"
+    database = tmp_path / "locatedb"
+    script = f'''
+install -D -m 755 "{source}" "{installed}"
+cat "{installed}"
+find "{tmp_path}" -name "*.txt" | sort
+printf "one two\\n" | xargs -n1 echo item
+updatedb -o "{database}" -U "{tmp_path}"
+locate -d "{database}" source.txt
+unlink "{installed}"
+'''
+    status, stdout, stderr, _shell = run_shell(script, env={"PATH": ""})
+    assert status == 0
+    assert "payload\n" in stdout
+    assert str(source) in stdout
+    assert str(installed) in stdout
+    assert "item one\nitem two\n" in stdout
+    assert not installed.exists()
+    assert stderr == ""
+
+
+def test_internal_diffutils_and_tar_without_path(tmp_path):
+    left = tmp_path / "left.txt"
+    right = tmp_path / "right.txt"
+    base = tmp_path / "base.txt"
+    tar_src = tmp_path / "tar-src"
+    tar_out = tmp_path / "tar-out"
+    archive = tmp_path / "archive.tar"
+    left.write_text("one\ntwo\n", encoding="utf-8")
+    right.write_text("one\nthree\n", encoding="utf-8")
+    base.write_text("one\n", encoding="utf-8")
+    tar_src.mkdir()
+    (tar_src / "entry.txt").write_text("inside\n", encoding="utf-8")
+    tar_out.mkdir()
+    script = f'''
+diff -u "{left}" "{right}"
+echo diff:$?
+cmp -s "{left}" "{left}"
+cmp -s "{left}" "{right}"
+echo cmp:$?
+diff3 "{left}" "{base}" "{right}"
+echo diff3:$?
+sdiff "{left}" "{right}"
+echo sdiff:$?
+tar -cf "{archive}" -C "{tar_src}" entry.txt
+tar -tf "{archive}"
+tar -xf "{archive}" -C "{tar_out}"
+cat "{tar_out / 'entry.txt'}"
+'''
+    status, stdout, stderr, _shell = run_shell(script, env={"PATH": ""})
+    assert status == 0
+    assert "--- " in stdout and "+++ " in stdout
+    assert "diff:1\n" in stdout
+    assert "cmp:1\n" in stdout
+    assert "diff3:1\n" in stdout
+    assert "sdiff:1\n" in stdout
+    assert "entry.txt\ninside\n" in stdout
+    assert stderr == ""
