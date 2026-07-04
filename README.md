@@ -1,28 +1,48 @@
 # py-posix-shell
 
-`py-posix-shell` is a small POSIX-style shell implemented in pure Python. It is
-intended to run on Windows, Linux, and macOS with the same Python package and the
-same console entry point.
+`py-posix-shell` is a cross-platform POSIX-style shell implemented in pure
+Python. The long-term goal is to become a practical `dash`-like shell that can
+run on Windows, Linux, and macOS from the same Python package.
 
-The project focuses on a practical, compact subset of POSIX shell behavior:
+It is still young, but it now supports the pieces needed by many ordinary shell
+scripts:
 
-- command lists with `;`, `&&`, `||`, and background `&`
+- command lists with `;`, `&&`, `||`, background `&`, and `!`
 - pipelines with `|`
+- `if`/`elif`/`else`/`fi`
+- `for`, `while`, and `until` loops with `break` and `continue`
+- `case`/`esac`
+- POSIX-style functions with `return`
+- grouping with `{ ...; }` and subshells with `( ... )`
 - quoting with single quotes, double quotes, and backslash escapes
-- parameter expansion such as `$HOME`, `$?`, `${name:-word}`, and `${name:=word}`
+- parameter expansion such as `$HOME`, `$?`, `${name:-word}`, `${name:=word}`,
+  `${#name}`, `${name#pattern}`, `${name##pattern}`, `${name%pattern}`, and
+  `${name%%pattern}`
+- arithmetic expansion with `$(( expression ))`
 - command substitution with `$(...)` and backticks
-- field splitting, pathname expansion, and tilde expansion
-- redirection with `<`, `>`, `>>`, `2>`, `2>>`, `>&`, and `<&`
+- field splitting, pathname expansion, tilde expansion, and `set -f`
+- here-documents with `<<` and `<<-`
+- redirection with `<`, `>`, `>>`, `<>`, `2>`, `2>>`, `>&`, and `<&`
 - shell variables, exported environment variables, and positional parameters
-- common builtins including `cd`, `pwd`, `exit`, `export`, `unset`, `set`,
-  `shift`, `echo`, `printf`, `read`, `type`, `command`, `env`, `test`, and `[`
+- common builtins including `.`, `:`, `alias`, `unalias`, `cd`, `pwd`, `eval`,
+  `exec`, `exit`, `export`, `readonly`, `unset`, `set`, `shift`, `getopts`,
+  `echo`, `printf`, `read`, `type`, `command`, `env`, `test`, `[`, `trap`,
+  `umask`, `times`, and `hash`
 
-It deliberately does not try to be a full replacement for `dash`, `bash`, or
-`zsh`. Complex POSIX features such as functions, aliases, job control, traps,
-arithmetic expansion, case/esac, for/while/until loops, and here-documents are
-not implemented yet.
+The implementation intentionally remains dependency-free at runtime. It aims for
+useful POSIX behavior first, then progressively tighter compatibility with
+`dash`.
+
+Known gaps include job control, full signal semantics, complete interactive line
+editing, and exact `set -e` edge cases.
 
 ## Installation
+
+From PyPI:
+
+```bash
+pip install py-posix-shell
+```
 
 From this repository:
 
@@ -66,4 +86,8 @@ Run the tests with:
 pytest
 ```
 
-The implementation uses only the Python standard library at runtime.
+Build the package with:
+
+```bash
+poetry build
+```

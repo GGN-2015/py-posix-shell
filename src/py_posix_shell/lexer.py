@@ -116,20 +116,27 @@ def lex(source: str) -> list[Token]:
                 j += 1
             if j < len(source) and source[j] in "<>":
                 op_end = j + 1
-                if op_end < len(source) and source[j : op_end + 1] in {">>", ">&", ">|", "<&", "<<"}:
+                if op_end < len(source) and source[j : op_end + 1] in {">>", ">&", ">|", "<&", "<<", "<<-", "<>"}:
                     op_end += 1
                 tokens.append(Operator(source[i:op_end]))
                 i = op_end
                 continue
 
+        three = source[i : i + 3]
+        if three == "<<-":
+            flush_word()
+            tokens.append(Operator(three))
+            i += 3
+            continue
+
         two = source[i : i + 2]
-        if two in {"&&", "||", ">>", ">&", ">|", "<&", "<<"}:
+        if two in {"&&", "||", ">>", ">&", ">|", "<&", "<<", "<>", ";;"}:
             flush_word()
             tokens.append(Operator(two))
             i += 2
             continue
 
-        if char in ";|&<>":
+        if char in ";|&<>()":
             flush_word()
             tokens.append(Operator(char))
             i += 1
@@ -196,6 +203,11 @@ def lex(source: str) -> list[Token]:
             else:
                 add_part("\\", PLAIN)
                 i += 1
+            continue
+
+        if char == "$" and source.startswith("$((", i):
+            value, i = read_arithmetic(source, i)
+            add_part(value, PLAIN)
             continue
 
         if char == "$" and i + 1 < len(source) and source[i + 1] == "(":
@@ -291,3 +303,41 @@ def read_backtick(source: str, start: int) -> tuple[str, int]:
             return source[start : i + 1], i + 1
         i += 1
     raise LexerError("unterminated command substitution")
+
+
+def read_arithmetic(source: str, start: int) -> tuple[str, int]:
+    i = start + 3
+    depth = 1
+    quote: str | None = None
+    escaped = False
+    while i < len(source):
+        char = source[i]
+        if escaped:
+            escaped = False
+            i += 1
+            continue
+        if char == "\\":
+            escaped = True
+            i += 1
+            continue
+        if quote:
+            if char == quote:
+                quote = None
+            i += 1
+            continue
+        if char in {"'", '"'}:
+            quote = char
+            i += 1
+            continue
+        if source.startswith("((", i):
+            depth += 1
+            i += 2
+            continue
+        if source.startswith("))", i):
+            depth -= 1
+            i += 2
+            if depth == 0:
+                return source[start:i], i
+            continue
+        i += 1
+    raise LexerError("unterminated arithmetic expansion")

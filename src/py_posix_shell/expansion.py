@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import glob
+import ast
+import fnmatch
 import os
 import re
 from dataclasses import dataclass
@@ -18,6 +20,9 @@ class Char:
 
 
 def expand_word(shell, word: Word, *, field_split: bool = True, pathname: bool = True) -> list[str]:
+    if field_split and word.parts and len(word.parts) == 1 and word.parts[0].mode == DOUBLE and word.parts[0].text == "$@":
+        return shell.positional.copy()
+
     chars, had_quoted = expand_word_to_chars(shell, word)
     if field_split:
         fields = split_fields(shell, chars, had_quoted)
@@ -29,7 +34,7 @@ def expand_word(shell, word: Word, *, field_split: bool = True, pathname: bool =
     result: list[str] = []
     for field in fields:
         text = chars_to_text(field)
-        if pathname and has_unquoted_glob(field):
+        if pathname and not shell.options.get("noglob", False) and has_unquoted_glob(field):
             matches = sorted(glob.glob(text))
             if matches:
                 result.extend(matches)
@@ -48,6 +53,10 @@ def expand_redirection(shell, word: Word) -> str:
     if len(fields) != 1:
         raise ExpansionError("ambiguous redirect")
     return fields[0]
+
+
+def expand_here_document(shell, body: str) -> str:
+    return chars_to_text(expand_text(shell, body, quoted=False))
 
 
 def expand_word_to_chars(shell, word: Word) -> tuple[list[Char], bool]:
@@ -114,6 +123,10 @@ def expand_dollar(shell, text: str, index: int, *, quoted: bool) -> tuple[list[C
         return [Char("$", quoted)], index + 1
     marker = text[index + 1]
 
+    if marker == "(" and index + 2 < len(text) and text[index + 2] == "(":
+        expression, end = read_arithmetic_expansion(text, index + 3)
+        return chars_for_value(str(eval_arithmetic(shell, expression)), quoted), end
+
     if marker == "(":
         command, end = read_command_substitution(text, index + 2)
         output = shell.capture(command).rstrip("\n")
@@ -134,7 +147,7 @@ def expand_dollar(shell, text: str, index: int, *, quoted: bool) -> tuple[list[C
         end = index + 2
         while end < len(text) and (text[end].isalnum() or text[end] == "_"):
             end += 1
-        return chars_for_value(shell.get_parameter(text[index + 1 : end]), quoted), end
+        return chars_for_value(shell.get_parameter(text[index + 1 : end], strict=True), quoted), end
 
     return [Char("$", quoted)], index + 1
 
@@ -144,6 +157,12 @@ def chars_for_value(value: str, quoted: bool) -> list[Char]:
 
 
 def expand_braced_parameter(shell, body: str, *, quoted: bool) -> str:
+    if body.startswith("#"):
+        name = body[1:]
+        if not name:
+            raise ExpansionError(f"bad substitution: ${{{body}}}")
+        return str(len(shell.get_parameter(name, strict=True)))
+
     name, op, word = split_parameter_body(body)
     if not name:
         raise ExpansionError(f"bad substitution: ${{{body}}}")
@@ -155,6 +174,8 @@ def expand_braced_parameter(shell, body: str, *, quoted: bool) -> str:
     test_fails = (not is_set) or (use_colon and is_null)
 
     if not op:
+        if not is_set and shell.options.get("nounset", False):
+            raise ExpansionError(f"{name}: parameter not set")
         return value
     if op in {"-", ":-"}:
         return expand_inline(shell, word, quoted=quoted) if test_fails else value
@@ -173,6 +194,9 @@ def expand_braced_parameter(shell, body: str, *, quoted: bool) -> str:
             message = expand_inline(shell, word, quoted=quoted) or f"{name}: parameter not set"
             raise ExpansionError(message)
         return value
+    if op in {"#", "##", "%", "%%"}:
+        pattern = expand_inline(shell, word, quoted=quoted)
+        return remove_pattern(value, pattern, op)
     raise ExpansionError(f"bad substitution: ${{{body}}}")
 
 
@@ -190,7 +214,7 @@ def split_parameter_body(body: str) -> tuple[str, str, str]:
         name = match.group(0)
         rest = body[len(name) :]
 
-    for op in (":-", ":=", ":+", ":?", "-", "=", "+", "?"):
+    for op in (":-", ":=", ":+", ":?", "##", "%%", "-", "=", "+", "?", "#", "%"):
         if rest.startswith(op):
             return name, op, rest[len(op) :]
     if rest:
@@ -285,6 +309,52 @@ def read_command_substitution(text: str, start: int) -> tuple[str, int]:
     raise ExpansionError("unterminated command substitution")
 
 
+def read_arithmetic_expansion(text: str, start: int) -> tuple[str, int]:
+    i = start
+    depth = 1
+    body: list[str] = []
+    quote: str | None = None
+    escaped = False
+    while i < len(text):
+        char = text[i]
+        if escaped:
+            body.append(char)
+            escaped = False
+            i += 1
+            continue
+        if char == "\\":
+            body.append(char)
+            escaped = True
+            i += 1
+            continue
+        if quote:
+            if char == quote:
+                quote = None
+            body.append(char)
+            i += 1
+            continue
+        if char in {"'", '"'}:
+            quote = char
+            body.append(char)
+            i += 1
+            continue
+        if text.startswith("((", i):
+            depth += 1
+            body.append("((")
+            i += 2
+            continue
+        if text.startswith("))", i):
+            depth -= 1
+            i += 2
+            if depth == 0:
+                return "".join(body), i
+            body.append("))")
+            continue
+        body.append(char)
+        i += 1
+    raise ExpansionError("unterminated arithmetic expansion")
+
+
 def read_backtick(text: str, start: int) -> tuple[str, int]:
     i = start
     escaped = False
@@ -344,3 +414,183 @@ def has_unquoted_glob(chars: list[Char]) -> bool:
 def chars_to_text(chars: list[Char]) -> str:
     return "".join(char.value for char in chars)
 
+
+def remove_pattern(value: str, pattern: str, op: str) -> str:
+    if op == "#":
+        cuts = range(0, len(value) + 1)
+        for cut in cuts:
+            if fnmatch.fnmatchcase(value[:cut], pattern):
+                return value[cut:]
+    if op == "##":
+        cuts = range(len(value), -1, -1)
+        for cut in cuts:
+            if fnmatch.fnmatchcase(value[:cut], pattern):
+                return value[cut:]
+    if op == "%":
+        cuts = range(len(value), -1, -1)
+        for cut in cuts:
+            if fnmatch.fnmatchcase(value[cut:], pattern):
+                return value[:cut]
+    if op == "%%":
+        cuts = range(0, len(value) + 1)
+        for cut in cuts:
+            if fnmatch.fnmatchcase(value[cut:], pattern):
+                return value[:cut]
+    return value
+
+
+def eval_arithmetic(shell, expression: str) -> int:
+    expression = expression.strip()
+    side_effect = eval_arithmetic_side_effect(shell, expression)
+    if side_effect is not None:
+        return side_effect
+    translated = translate_arithmetic(expression)
+    try:
+        tree = ast.parse(translated, mode="eval")
+    except SyntaxError as exc:
+        raise ExpansionError(f"bad arithmetic expression: {expression}") from exc
+    return int(eval_arithmetic_node(shell, tree.body))
+
+
+def eval_arithmetic_side_effect(shell, expression: str) -> int | None:
+    match = re.fullmatch(r"([A-Za-z_][A-Za-z0-9_]*)\s*(\+\+|--)", expression)
+    if match:
+        name, op = match.groups()
+        old = arithmetic_parameter(shell, name)
+        shell.set_parameter(name, str(old + (1 if op == "++" else -1)))
+        return old
+
+    match = re.fullmatch(r"(\+\+|--)\s*([A-Za-z_][A-Za-z0-9_]*)", expression)
+    if match:
+        op, name = match.groups()
+        new = arithmetic_parameter(shell, name) + (1 if op == "++" else -1)
+        shell.set_parameter(name, str(new))
+        return new
+
+    match = re.fullmatch(r"([A-Za-z_][A-Za-z0-9_]*)\s*([+\-*/%&|^]?=|<<=|>>=)\s*(.+)", expression)
+    if not match:
+        return None
+    name, op, rhs = match.groups()
+    right = eval_arithmetic(shell, rhs)
+    if op == "=":
+        value = right
+    else:
+        left = arithmetic_parameter(shell, name)
+        if op == "+=":
+            value = left + right
+        elif op == "-=":
+            value = left - right
+        elif op == "*=":
+            value = left * right
+        elif op == "/=":
+            if right == 0:
+                raise ExpansionError("division by zero")
+            value = int(left / right)
+        elif op == "%=":
+            if right == 0:
+                raise ExpansionError("division by zero")
+            value = left % right
+        elif op == "&=":
+            value = left & right
+        elif op == "|=":
+            value = left | right
+        elif op == "^=":
+            value = left ^ right
+        elif op == "<<=":
+            value = left << right
+        elif op == ">>=":
+            value = left >> right
+        else:
+            raise ExpansionError(f"bad arithmetic assignment: {expression}")
+    shell.set_parameter(name, str(value))
+    return value
+
+
+def arithmetic_parameter(shell, name: str) -> int:
+    value = shell.get_parameter(name) or "0"
+    try:
+        return int(value, 0)
+    except ValueError:
+        return 0
+
+
+def translate_arithmetic(expression: str) -> str:
+    expression = expression.replace("&&", " and ").replace("||", " or ")
+    expression = re.sub(r"(?<![=!<>])!(?!=)", " not ", expression)
+    return expression
+
+
+def eval_arithmetic_node(shell, node: ast.AST) -> int:
+    if isinstance(node, ast.Constant) and isinstance(node.value, (int, bool)):
+        return int(node.value)
+    if isinstance(node, ast.Name):
+        value = shell.get_parameter(node.id) or "0"
+        try:
+            return int(value, 0)
+        except ValueError:
+            return 0
+    if isinstance(node, ast.UnaryOp):
+        value = eval_arithmetic_node(shell, node.operand)
+        if isinstance(node.op, ast.UAdd):
+            return value
+        if isinstance(node.op, ast.USub):
+            return -value
+        if isinstance(node.op, ast.Invert):
+            return ~value
+        if isinstance(node.op, ast.Not):
+            return 0 if value else 1
+    if isinstance(node, ast.BinOp):
+        left = eval_arithmetic_node(shell, node.left)
+        right = eval_arithmetic_node(shell, node.right)
+        if isinstance(node.op, ast.Add):
+            return left + right
+        if isinstance(node.op, ast.Sub):
+            return left - right
+        if isinstance(node.op, ast.Mult):
+            return left * right
+        if isinstance(node.op, (ast.Div, ast.FloorDiv)):
+            if right == 0:
+                raise ExpansionError("division by zero")
+            return int(left / right)
+        if isinstance(node.op, ast.Mod):
+            if right == 0:
+                raise ExpansionError("division by zero")
+            return left % right
+        if isinstance(node.op, ast.LShift):
+            return left << right
+        if isinstance(node.op, ast.RShift):
+            return left >> right
+        if isinstance(node.op, ast.BitAnd):
+            return left & right
+        if isinstance(node.op, ast.BitOr):
+            return left | right
+        if isinstance(node.op, ast.BitXor):
+            return left ^ right
+    if isinstance(node, ast.BoolOp):
+        if isinstance(node.op, ast.And):
+            for value_node in node.values:
+                if eval_arithmetic_node(shell, value_node) == 0:
+                    return 0
+            return 1
+        if isinstance(node.op, ast.Or):
+            for value_node in node.values:
+                if eval_arithmetic_node(shell, value_node) != 0:
+                    return 1
+            return 0
+    if isinstance(node, ast.Compare):
+        left = eval_arithmetic_node(shell, node.left)
+        for op, comparator in zip(node.ops, node.comparators):
+            right = eval_arithmetic_node(shell, comparator)
+            ok = (
+                (isinstance(op, ast.Eq) and left == right)
+                or (isinstance(op, ast.NotEq) and left != right)
+                or (isinstance(op, ast.Lt) and left < right)
+                or (isinstance(op, ast.LtE) and left <= right)
+                or (isinstance(op, ast.Gt) and left > right)
+                or (isinstance(op, ast.GtE) and left >= right)
+            )
+            if not ok:
+                return 0
+            left = right
+        return 1
+    raise ExpansionError("unsupported arithmetic expression")
