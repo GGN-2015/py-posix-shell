@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from typing import TypeAlias
 
 from .errors import ParseError
-from .lexer import Operator, Token, Word, is_name, lex
+from .lexer import Operator, Part, Token, Word, is_name, lex
 
 
 @dataclass(frozen=True)
@@ -293,6 +293,9 @@ class Parser:
 
         while not self._at_end() and not self._at_stop(stop_words, stop_ops):
             token = self._peek()
+            if isinstance(token, Word) and self._is_array_append_assignment(token) and not seen_command_word:
+                assignments.append(self._parse_array_append_assignment())
+                continue
             if isinstance(token, Operator):
                 redir = parse_redirection_operator(token.value)
                 if redir is None:
@@ -314,6 +317,22 @@ class Parser:
             token = self._peek() if not self._at_end() else None
             raise ParseError(f"expected command, got {self._describe(token)}")
         return SimpleCommand(tuple(assignments), tuple(words), tuple(redirections))
+
+    def _is_array_append_assignment(self, token: Word) -> bool:
+        return (
+            token.text.endswith("+=")
+            and is_name(token.text[:-2])
+            and self._peek_operator(1) == "("
+        )
+
+    def _parse_array_append_assignment(self) -> tuple[str, Word]:
+        name = self._consume_word().text[:-2]
+        self._expect_operator("(")
+        values: list[str] = []
+        while not self._at_end() and self._peek_operator() != ")":
+            values.append(self._consume_word().text)
+        self._expect_operator(")")
+        return name, Word((Part(" ".join(values)),))
 
     def _parse_redirections(self) -> tuple[Redirection, ...]:
         redirections: list[Redirection] = []

@@ -17,7 +17,7 @@ from typing import Iterator, TextIO
 
 from .builtins import BUILTINS, SPECIAL_BUILTINS
 from .errors import ExpansionError, LexerError, ParseError, ShellBreak, ShellContinue, ShellExit, ShellReturn
-from .expansion import expand_assignment, expand_here_document, expand_redirection, expand_word
+from .expansion import chars_to_text, expand_assignment, expand_here_document, expand_redirection, expand_text, expand_word
 from .lexer import Operator, Word, lex
 from .parser import (
     AndOrList,
@@ -791,6 +791,7 @@ class Shell:
         opened: list[TextIO] = []
         try:
             for fd, op, target in redirections:
+                target = normalize_redirection_target(target)
                 if op in {"<", "<&"} and op == "<":
                     file = open(target, "r", encoding="utf-8", errors="replace")
                     opened.append(file)
@@ -838,7 +839,20 @@ class Shell:
         status = 0
         buffer = ""
         while True:
-            prompt = self.get_parameter("PS2") if buffer else self.get_parameter("PS1") or "$ "
+            prompt_source = self.get_parameter("PS2") if buffer else self.get_parameter("PS1") or "$ "
+            try:
+                prompt = self.expand_prompt(prompt_source)
+            except KeyboardInterrupt:
+                self.stdout.write("\n")
+                buffer = ""
+                status = 130
+                self.last_status = status
+                continue
+            except ExpansionError as exc:
+                self.stderr.write(f"{self.argv0}: {exc}\n")
+                prompt = prompt_source
+                status = 2
+                self.last_status = status
             try:
                 line = input(prompt)
             except EOFError:
@@ -876,6 +890,9 @@ class Shell:
                 status = 130
                 self.last_status = status
             buffer = ""
+
+    def expand_prompt(self, prompt: str) -> str:
+        return chars_to_text(expand_text(self, prompt, quoted=True))
 
     def get_parameter(self, name: str, *, strict: bool = False) -> str:
         if name == "?":
@@ -969,6 +986,12 @@ def has_fileno(stream: TextIO) -> bool:
     except (AttributeError, OSError, io.UnsupportedOperation):
         return False
     return True
+
+
+def normalize_redirection_target(target: str) -> str:
+    if os.name == "nt" and target == "/dev/null":
+        return os.devnull
+    return target
 
 
 def stop_process_after_interrupt(process: subprocess.Popen[str]) -> None:

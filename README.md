@@ -35,7 +35,7 @@ scripts:
   `sort`, `uniq`, `wc`, `cut`, `head`, `tail`, `chmod`, `chown`, `chgrp`,
   `echo`, `date`, `sleep`, `printf`, `basename`, `dirname`, `whoami`, `yes`,
   `find`, `xargs`, `locate`, `updatedb`, `diff`, `cmp`, `diff3`, `sdiff`,
-  `grep`, `egrep`, `fgrep`, `sed`, `awk`, `gawk`, and `tar`
+  `grep`, `egrep`, `fgrep`, `sed`, `awk`, `gawk`, `base64`, `tr`, and `tar`
 
 The implementation intentionally remains dependency-free at runtime. It aims for
 useful POSIX behavior first, then progressively tighter compatibility with

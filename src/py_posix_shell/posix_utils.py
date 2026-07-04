@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import ast
+import base64
+import binascii
 import datetime as _datetime
 import difflib
 import fnmatch
@@ -49,6 +51,97 @@ def utility_cat(shell, argv: list[str], stdin: TextIO, stdout: TextIO, stderr: T
             stderr.write(f"cat: {path}: {exc.strerror or exc}\n")
             status = 1
     return status
+
+
+def utility_base64(shell, argv: list[str], stdin: TextIO, stdout: TextIO, stderr: TextIO) -> int:
+    decode = False
+    paths: list[str] = []
+    i = 1
+    while i < len(argv):
+        arg = argv[i]
+        if arg == "--":
+            paths.extend(argv[i + 1 :])
+            break
+        if arg in {"-d", "-D", "--decode"}:
+            decode = True
+        elif arg in {"-w", "--wrap"}:
+            i += 1
+            if i >= len(argv):
+                stderr.write("base64: option requires an argument -- w\n")
+                return 2
+        elif arg.startswith("-w") and len(arg) > 2:
+            pass
+        elif arg.startswith("-") and arg != "-":
+            for flag in arg[1:]:
+                if flag in {"d", "D"}:
+                    decode = True
+                else:
+                    stderr.write(f"base64: invalid option -- {flag}\n")
+                    return 2
+        else:
+            paths.append(arg)
+        i += 1
+
+    try:
+        data = b"".join(read_binary_inputs(paths or ["-"], stdin))
+        if decode:
+            decoded = base64.b64decode(b"".join(data.split()), validate=False)
+            write_binary_output(stdout, decoded)
+        else:
+            encoded = base64.encodebytes(data)
+            write_binary_output(stdout, encoded)
+    except (binascii.Error, ValueError) as exc:
+        stderr.write(f"base64: invalid input: {exc}\n")
+        return 1
+    except OSError as exc:
+        stderr.write(f"base64: {exc.strerror or exc}\n")
+        return 1
+    return 0
+
+
+def utility_tr(shell, argv: list[str], stdin: TextIO, stdout: TextIO, stderr: TextIO) -> int:
+    delete = False
+    squeeze = False
+    args: list[str] = []
+    for arg in argv[1:]:
+        if arg == "--":
+            continue
+        if arg.startswith("-") and arg != "-":
+            for flag in arg[1:]:
+                if flag == "d":
+                    delete = True
+                elif flag == "s":
+                    squeeze = True
+                else:
+                    stderr.write(f"tr: invalid option -- {flag}\n")
+                    return 2
+        else:
+            args.append(arg)
+    if delete:
+        if not args:
+            stderr.write("tr: missing operand\n")
+            return 2
+        delete_chars = set(expand_tr_set(args[0]))
+        squeeze_chars = set(expand_tr_set(args[1])) if squeeze and len(args) > 1 else delete_chars
+        result = "".join(char for char in stdin.read() if char not in delete_chars)
+        stdout.write(squeeze_repeated_chars(result, squeeze_chars) if squeeze else result)
+        return 0
+    if len(args) < 2:
+        stderr.write("tr: missing operand after set1\n")
+        return 2
+    source = expand_tr_set(args[0])
+    target = expand_tr_set(args[1])
+    if not target:
+        stderr.write("tr: set2 must not be empty\n")
+        return 2
+    translation: dict[int, str] = {}
+    for index, char in enumerate(source):
+        translation[ord(char)] = target[index] if index < len(target) else target[-1]
+    result = stdin.read().translate(translation)
+    if squeeze:
+        result = squeeze_repeated_chars(result, set(target))
+    stdout.write(result)
+    return 0
 
 
 def utility_ls(shell, argv: list[str], stdin: TextIO, stdout: TextIO, stderr: TextIO) -> int:
@@ -389,11 +482,15 @@ def utility_wc(shell, argv: list[str], stdin: TextIO, stdout: TextIO, stderr: Te
 
     rows: list[tuple[int, int, int, str | None]] = []
     status = 0
-    for path, text in read_text_inputs(paths or ["-"], stdin, stderr, "wc"):
-        if text is None:
+    for path in paths or ["-"]:
+        try:
+            data = next(iter(read_binary_inputs([path], stdin)))
+        except OSError as exc:
+            stderr.write(f"wc: {path}: {exc.strerror or exc}\n")
             status = 1
             continue
-        rows.append((text.count("\n"), len(text.split()), len(text.encode("utf-8")), None if path == "-" else path))
+        text = data.decode("utf-8", errors="replace")
+        rows.append((data.count(b"\n"), len(text.split()), len(data), None if path == "-" else path))
     for lines, words, bytes_count, name in rows:
         values: list[str] = []
         if count_lines:
@@ -1518,12 +1615,13 @@ def display_name(entry: Path, base: Path) -> str:
 
 def format_long_listing(path: Path, name: str) -> str:
     try:
-        info = path.stat()
+        info = path.lstat()
     except OSError:
-        return f"?????????? 0 {name}"
+        return f"?????????? 0 unknown unknown 0 Jan 01 00:00 {name}"
     mode = stat.filemode(info.st_mode)
     mtime = _datetime.datetime.fromtimestamp(info.st_mtime).strftime("%b %d %H:%M")
-    return f"{mode} 1 {info.st_size:>8} {mtime} {name}"
+    owner, group = owner_group_names(info)
+    return f"{mode} {getattr(info, 'st_nlink', 1):>2} {owner:<8} {group:<8} {info.st_size:>8} {mtime} {name}"
 
 
 def parse_line_count_args(command: str, argv: list[str], stderr: TextIO, *, default: int) -> tuple[int, list[str], int]:
@@ -1614,6 +1712,127 @@ def parse_csv_line(line: str) -> list[str]:
         i += 1
     result.append("".join(field))
     return result
+
+
+def read_binary_inputs(paths: Iterable[str], stdin: TextIO) -> Iterable[bytes]:
+    for path in paths:
+        if path == "-":
+            buffer = getattr(stdin, "buffer", None)
+            if buffer is not None:
+                yield buffer.read()
+            else:
+                yield stdin.read().encode("utf-8")
+            continue
+        yield Path(path).read_bytes()
+
+
+def write_binary_output(stdout: TextIO, data: bytes) -> None:
+    buffer = getattr(stdout, "buffer", None)
+    if buffer is not None:
+        buffer.write(data)
+        buffer.flush()
+    else:
+        stdout.write(data.decode("latin-1"))
+
+
+def expand_tr_set(spec: str) -> str:
+    result: list[str] = []
+    index = 0
+    while index < len(spec):
+        first, index = read_tr_unit(spec, index)
+        if index < len(spec) - 1 and spec[index] == "-" and len(first) == 1:
+            second, next_index = read_tr_unit(spec, index + 1)
+            if len(second) == 1:
+                start = ord(first)
+                end = ord(second)
+                step = 1 if start <= end else -1
+                result.extend(chr(value) for value in range(start, end + step, step))
+                index = next_index
+                continue
+        result.extend(first)
+    return "".join(result)
+
+
+def read_tr_unit(spec: str, index: int) -> tuple[str, int]:
+    if spec.startswith("[:", index):
+        end = spec.find(":]", index + 2)
+        if end != -1:
+            name = spec[index + 2 : end]
+            return tr_character_class(name), end + 2
+    char = spec[index]
+    if char != "\\":
+        return char, index + 1
+    if index + 1 >= len(spec):
+        return "\\", index + 1
+    marker = spec[index + 1]
+    escapes = {
+        "a": "\a",
+        "b": "\b",
+        "f": "\f",
+        "n": "\n",
+        "r": "\r",
+        "t": "\t",
+        "v": "\v",
+        "\\": "\\",
+    }
+    if marker in escapes:
+        return escapes[marker], index + 2
+    if marker in "01234567":
+        end = index + 1
+        while end < len(spec) and end < index + 4 and spec[end] in "01234567":
+            end += 1
+        return chr(int(spec[index + 1 : end], 8)), end
+    return marker, index + 2
+
+
+def tr_character_class(name: str) -> str:
+    classes = {
+        "alnum": "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz",
+        "alpha": "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz",
+        "blank": " \t",
+        "digit": "0123456789",
+        "lower": "abcdefghijklmnopqrstuvwxyz",
+        "space": " \t\r\n\v\f",
+        "upper": "ABCDEFGHIJKLMNOPQRSTUVWXYZ",
+        "xdigit": "0123456789ABCDEFabcdef",
+    }
+    return classes.get(name, "")
+
+
+def squeeze_repeated_chars(text: str, chars: set[str]) -> str:
+    if not text or not chars:
+        return text
+    result: list[str] = []
+    previous = ""
+    for char in text:
+        if char == previous and char in chars:
+            continue
+        result.append(char)
+        previous = char
+    return "".join(result)
+
+
+def owner_group_names(info: os.stat_result) -> tuple[str, str]:
+    owner = str(getattr(info, "st_uid", "user"))
+    group = str(getattr(info, "st_gid", "group"))
+    if pwd is not None:
+        try:
+            owner = pwd.getpwuid(info.st_uid).pw_name
+        except (KeyError, AttributeError):
+            pass
+    else:
+        try:
+            owner = getpass.getuser()
+        except OSError:
+            owner = "user"
+    if grp is not None:
+        try:
+            group = grp.getgrgid(info.st_gid).gr_name
+        except (KeyError, AttributeError):
+            pass
+    elif not group or group.isdigit():
+        group = owner
+    return owner.replace(" ", "_"), group.replace(" ", "_")
 
 
 def split_owner_group(spec: str) -> tuple[str | None, str | None]:
@@ -2344,6 +2563,7 @@ def sys_argv0() -> str:
 INTERNAL_UTILITIES: dict[str, Utility] = {
     "awk": utility_gawk,
     "basename": utility_basename,
+    "base64": utility_base64,
     "cat": utility_cat,
     "chmod": utility_chmod,
     "chgrp": utility_chgrp,
@@ -2382,6 +2602,7 @@ INTERNAL_UTILITIES: dict[str, Utility] = {
     "tail": utility_tail,
     "tar": utility_tar,
     "touch": utility_touch,
+    "tr": utility_tr,
     "uname": utility_uname,
     "uniq": utility_uniq,
     "unlink": utility_unlink,

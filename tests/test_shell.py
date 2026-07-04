@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import io
 import os
 import sys
@@ -392,6 +393,118 @@ def test_repl_keyboard_interrupt_returns_to_prompt(monkeypatch):
     assert shell.repl() == 0
     assert shell.last_status == 0
     assert stdout.getvalue() == "\nafter:130\n\n"
+
+
+def test_py_web_ssh_cwd_prompt_injection_without_native_utilities(monkeypatch, tmp_path):
+    token = "testtoken"
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    old_cwd = os.getcwd()
+    os.chdir(tmp_path)
+    try:
+        (tmp_path / "visible.txt").write_text("visible\n", encoding="utf-8")
+        shell = Shell(stdout=stdout, stderr=stderr, env={"PATH": ""}, interactive=True)
+        commands = (
+            "__py_web_ssh_cwd_armed=; "
+            "__py_web_ssh_cwd_ready(){ "
+            "[ -n \"${__py_web_ssh_cwd_armed-}\" ] || return; "
+            "printf '\\033]6970;ready;testtoken=1\\007' >&2; "
+            "}",
+            "__py_web_ssh_cwd_list(){ "
+            "[ -n \"${__py_web_ssh_cwd_armed-}\" ] || return; "
+            "__py_web_ssh_cwd_ls=$(LC_ALL=C command ls -al 2>&1 | command base64 | command tr -d '\\r\\n') || __py_web_ssh_cwd_ls=; "
+            "printf '\\033]6970;ls;testtoken=%s\\007' \"$__py_web_ssh_cwd_ls\" >&2; "
+            "}",
+            "__py_web_ssh_cwd_report(){ "
+            "[ -n \"${__py_web_ssh_cwd_armed-}\" ] || return; "
+            "__py_web_ssh_cwd_now=$(command pwd 2>/dev/null || printf '%s' \"$PWD\") || return; "
+            "if [ \"${__py_web_ssh_cwd_now}\" != \"${__py_web_ssh_cwd_last-}\" ]; then "
+            "__py_web_ssh_cwd_last=$__py_web_ssh_cwd_now; "
+            "printf '\\033]6970;cwd;testtoken=%s\\007' \"$__py_web_ssh_cwd_now\" >&2; "
+            "__py_web_ssh_cwd_list; "
+            "fi; "
+            "__py_web_ssh_cwd_ready; "
+            "}",
+            "if [ -n \"${BASH_VERSION:-}\" ]; then "
+            "PROMPT_COMMAND=\"__py_web_ssh_cwd_report${PROMPT_COMMAND:+;$PROMPT_COMMAND}\"; "
+            "elif [ -n \"${ZSH_VERSION:-}\" ]; then "
+            "autoload -Uz add-zsh-hook 2>/dev/null && add-zsh-hook precmd __py_web_ssh_cwd_report || "
+            "precmd_functions+=(__py_web_ssh_cwd_report); "
+            "else "
+            "__py_web_ssh_cwd_prompt=; "
+            "PS1='${__py_web_ssh_cwd_prompt:-$(__py_web_ssh_cwd_report)}'\"${PS1-}\"; "
+            "PS2='${__py_web_ssh_cwd_prompt:-$(__py_web_ssh_cwd_report)}'\"${PS2-}\"; "
+            "fi",
+        )
+        for command in commands:
+            assert shell.execute(command) == 0, stderr.getvalue()
+        assert shell.execute("__py_web_ssh_cwd_armed=1") == 0
+        stderr.seek(0)
+        stderr.truncate(0)
+        prompts: list[str] = []
+
+        def fake_input(prompt):
+            prompts.append(prompt)
+            raise EOFError
+
+        monkeypatch.setattr("builtins.input", fake_input)
+
+        assert shell.repl() == 0
+        hidden = stderr.getvalue()
+        assert prompts == [""]
+        assert f"\x1b]6970;cwd;{token}=".encode().decode() in hidden
+        assert f"\x1b]6970;ls;{token}=" in hidden
+        assert f"\x1b]6970;ready;{token}=1\x07" in hidden
+        listing_payload = hidden.split(f"\x1b]6970;ls;{token}=", 1)[1].split("\x07", 1)[0]
+        listing_text = base64.b64decode(listing_payload).decode("utf-8", errors="replace")
+        visible_line = next(line for line in listing_text.splitlines() if line.endswith(" visible.txt"))
+        assert len(visible_line.split(maxsplit=8)) == 9
+    finally:
+        os.chdir(old_cwd)
+
+
+def test_py_web_ssh_base64_transfer_commands_without_native_utilities(tmp_path):
+    raw = b"\x00hello\r\nweb-ssh\xff"
+    source = tmp_path / "source.bin"
+    encoded = tmp_path / "source.b64"
+    decoded_d = tmp_path / "decoded-d.bin"
+    decoded_bsd = tmp_path / "decoded-bsd.bin"
+    size_path = tmp_path / "size.txt"
+    temp = tmp_path / "upload.tmp"
+    final = tmp_path / "final.bin"
+    b64_temp = tmp_path / "upload.b64"
+    err = tmp_path / "upload.tmp.err"
+    source.write_bytes(raw)
+    b64_temp.write_bytes(base64.b64encode(raw))
+    script = f'''
+command base64 < "{source}" | command tr -d '\\r\\n' > "{encoded}"
+command base64 -d < "{encoded}" > "{decoded_d}"
+command base64 -D < "{encoded}" > "{decoded_bsd}"
+if [ -f "{source}" ]; then wc -c < "{source}" > "{size_path}"; else exit 2; fi
+set -e
+rm -f "{temp}" "{err}"
+if command base64 -d < "{b64_temp}" > "{temp}" 2> "{err}"; then
+  :
+elif command base64 -D < "{b64_temp}" > "{temp}" 2> "{err}"; then
+  :
+else
+  cat "{err}" >&2
+  exit 1
+fi
+mv -f "{temp}" "{final}"
+rm -f "{b64_temp}" "{err}"
+'''
+    status, stdout, stderr, _shell = run_shell(script, env={"PATH": ""})
+    assert status == 0
+    assert stdout == ""
+    assert stderr == ""
+    assert base64.b64decode(encoded.read_bytes()) == raw
+    assert decoded_d.read_bytes() == raw
+    assert decoded_bsd.read_bytes() == raw
+    assert int(size_path.read_text(encoding="utf-8").strip()) == len(raw)
+    assert final.read_bytes() == raw
+    assert not b64_temp.exists()
+    assert not err.exists()
 
 
 def test_internal_extended_text_utilities_without_path(tmp_path):
