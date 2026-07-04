@@ -33,7 +33,7 @@ scripts:
   otherwise falls back to Python implementations of common tools including
   `ls`, `cat`, `cp`, `mv`, `rm`, `install`, `unlink`, `mkdir`, `rmdir`, `pwd`,
   `sort`, `uniq`, `wc`, `cut`, `head`, `tail`, `chmod`, `chown`, `chgrp`,
-  `echo`, `date`, `sleep`, `printf`, `basename`, `dirname`, `whoami`, `yes`,
+  `echo`, `date`, `sleep`, `printf`, `basename`, `dirname`, `whoami`, `yes`, `clear`,
   `find`, `xargs`, `locate`, `updatedb`, `diff`, `cmp`, `diff3`, `sdiff`,
   `grep`, `egrep`, `fgrep`, `sed`, `awk`, `gawk`, `base64`, `tr`, and `tar`
 

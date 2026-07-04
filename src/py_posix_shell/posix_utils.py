@@ -144,6 +144,33 @@ def utility_tr(shell, argv: list[str], stdin: TextIO, stdout: TextIO, stderr: Te
     return 0
 
 
+def utility_clear(shell, argv: list[str], stdin: TextIO, stdout: TextIO, stderr: TextIO) -> int:
+    index = 1
+    while index < len(argv):
+        arg = argv[index]
+        if arg == "--":
+            break
+        if arg == "-T":
+            index += 2
+            continue
+        if arg in {"-V", "--version"}:
+            stdout.write("py-posix-shell clear fallback\n")
+            return 0
+        if arg in {"-x"}:
+            index += 1
+            continue
+        if arg.startswith("-"):
+            stderr.write(f"clear: invalid option: {arg}\n")
+            return 2
+        index += 1
+    stdout.write("\033[H\033[2J")
+    try:
+        stdout.flush()
+    except OSError:
+        pass
+    return 0
+
+
 def utility_ls(shell, argv: list[str], stdin: TextIO, stdout: TextIO, stderr: TextIO) -> int:
     show_all = False
     almost_all = False
@@ -2568,6 +2595,7 @@ INTERNAL_UTILITIES: dict[str, Utility] = {
     "chmod": utility_chmod,
     "chgrp": utility_chgrp,
     "chown": utility_chown,
+    "clear": utility_clear,
     "cmp": utility_cmp,
     "cp": utility_cp,
     "cut": utility_cut,

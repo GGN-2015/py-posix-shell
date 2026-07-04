@@ -395,6 +395,29 @@ def test_repl_keyboard_interrupt_returns_to_prompt(monkeypatch):
     assert stdout.getvalue() == "\nafter:130\n\n"
 
 
+def test_repl_syntax_error_reports_and_keeps_session_alive(monkeypatch):
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    shell = Shell(stdout=stdout, stderr=stderr, interactive=True)
+    events = iter([">", "echo |", "echo after:$?", EOFError])
+
+    def fake_input(_prompt):
+        event = next(events)
+        if isinstance(event, type) and issubclass(event, BaseException):
+            raise event
+        return event
+
+    monkeypatch.setattr("builtins.input", fake_input)
+
+    assert shell.repl() == 0
+    assert shell.last_status == 0
+    assert stdout.getvalue() == "after:2\n\n"
+    errors = stderr.getvalue()
+    assert "pysh: syntax error:" in errors
+    assert "expected word" in errors
+    assert "expected command after pipe" in errors
+
+
 def test_py_web_ssh_cwd_prompt_injection_without_native_utilities(monkeypatch, tmp_path):
     token = "testtoken"
     stdout = io.StringIO()
@@ -533,6 +556,13 @@ yes ok | head -n 2
     assert "fixed-miss:1\n" in stdout
     assert "ALPHA\nALPHA\n" in stdout
     assert stdout.endswith("ok\nok\n")
+    assert stderr == ""
+
+
+def test_internal_clear_utility_without_path():
+    status, stdout, stderr, _shell = run_shell("clear", env={"PATH": ""})
+    assert status == 0
+    assert stdout == "\033[H\033[2J"
     assert stderr == ""
 
 

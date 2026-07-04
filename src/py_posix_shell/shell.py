@@ -874,6 +874,13 @@ class Shell:
                 self.stderr.write(f"{self.argv0}: {exc}\n")
                 buffer = ""
                 status = 2
+                self.last_status = status
+                continue
+            except ParseError as exc:
+                self.stderr.write(f"{self.argv0}: syntax error: {exc}\n")
+                buffer = ""
+                status = 2
+                self.last_status = status
                 continue
             except KeyboardInterrupt:
                 self.stdout.write("\n")
