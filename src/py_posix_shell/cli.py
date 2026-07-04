@@ -35,6 +35,9 @@ def main(argv: list[str] | None = None) -> int:
             return shell.execute(args.command)
         except ShellExit as exc:
             return exc.status
+        except KeyboardInterrupt:
+            print(file=sys.stderr)
+            return 130
 
     if args.script:
         try:
@@ -48,13 +51,22 @@ def main(argv: list[str] | None = None) -> int:
             return shell.execute(source)
         except ShellExit as exc:
             return exc.status
+        except KeyboardInterrupt:
+            print(file=sys.stderr)
+            return 130
 
     interactive = args.interactive or sys.stdin.isatty()
     shell = Shell(argv0="pysh", interactive=interactive)
     if interactive:
-        return shell.repl()
+        try:
+            return shell.repl()
+        except KeyboardInterrupt:
+            print(file=sys.stderr)
+            return 130
     try:
         return shell.execute(sys.stdin.read())
     except ShellExit as exc:
         return exc.status
-
+    except KeyboardInterrupt:
+        print(file=sys.stderr)
+        return 130

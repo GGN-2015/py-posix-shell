@@ -6,6 +6,7 @@ import contextlib
 import fnmatch
 import io
 import os
+import signal
 import shlex
 import shutil
 import subprocess
@@ -141,6 +142,8 @@ class Shell:
         except ShellContinue:
             self.stderr.write(f"{self.argv0}: continue: only meaningful in a loop\n")
             status = 2
+        except KeyboardInterrupt:
+            status = 130
         except ShellExit as exc:
             self.last_status = exc.status
             if self._execute_depth == 1:
@@ -700,10 +703,10 @@ class Shell:
         communicate_input = input_text
 
         if input_text is not None:
-            popen_stdin = None
+            popen_stdin = subprocess.PIPE
         elif not has_fileno(stdin):
             communicate_input = stdin.read()
-            popen_stdin = None
+            popen_stdin = subprocess.PIPE
 
         stdout_capture_target: TextIO | None = None
         if capture_stdout:
@@ -718,34 +721,39 @@ class Shell:
             popen_stderr = subprocess.PIPE
 
         try:
-            completed = subprocess.run(
+            process = subprocess.Popen(
                 [executable, *argv[1:]],
-                input=communicate_input,
                 stdin=popen_stdin,
                 stdout=popen_stdout,
                 stderr=popen_stderr,
                 env=env,
                 text=True,
             )
+            completed_stdout, completed_stderr = process.communicate(input=communicate_input)
         except PermissionError:
             (stderr or self.stderr).write(f"{argv[0]}: permission denied\n")
             return 126
         except FileNotFoundError:
             (stderr or self.stderr).write(f"{argv[0]}: command not found\n")
             return 127
+        except KeyboardInterrupt:
+            if "process" in locals():
+                stop_process_after_interrupt(process)
+            self._last_external_output = ""
+            return 130
         except OSError as exc:
             (stderr or self.stderr).write(f"{argv[0]}: {exc}\n")
             return 126
 
-        if capture_stdout and completed.stdout:
-            self._last_external_output = completed.stdout
+        if capture_stdout and completed_stdout:
+            self._last_external_output = completed_stdout
         else:
             self._last_external_output = ""
-        if stdout_capture_target is not None and completed.stdout:
-            stdout_capture_target.write(completed.stdout)
-        if stderr_capture_target is not None and completed.stderr:
-            stderr_capture_target.write(completed.stderr)
-        return completed.returncode
+        if stdout_capture_target is not None and completed_stdout:
+            stdout_capture_target.write(completed_stdout)
+        if stderr_capture_target is not None and completed_stderr:
+            stderr_capture_target.write(completed_stderr)
+        return normalize_process_status(process.returncode)
 
     def run_preexpanded(self, argv: list[str], *, stdin: TextIO, stdout: TextIO, stderr: TextIO) -> int:
         if not argv:
@@ -836,6 +844,12 @@ class Shell:
             except EOFError:
                 self.stdout.write("\n")
                 return status
+            except KeyboardInterrupt:
+                self.stdout.write("\n")
+                buffer = ""
+                status = 130
+                self.last_status = status
+                continue
             candidate = buffer + line + "\n"
             try:
                 parse(candidate)
@@ -851,6 +865,10 @@ class Shell:
                 status = self.execute(candidate)
             except ShellExit as exc:
                 return exc.status
+            except KeyboardInterrupt:
+                self.stdout.write("\n")
+                status = 130
+                self.last_status = status
             buffer = ""
 
     def get_parameter(self, name: str, *, strict: bool = False) -> str:
@@ -945,6 +963,46 @@ def has_fileno(stream: TextIO) -> bool:
     except (AttributeError, OSError, io.UnsupportedOperation):
         return False
     return True
+
+
+def stop_process_after_interrupt(process: subprocess.Popen[str]) -> None:
+    try:
+        process.wait(timeout=0.2)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    except OSError:
+        return
+
+    try:
+        if os.name == "nt":
+            process.terminate()
+        else:
+            process.send_signal(signal.SIGINT)
+    except OSError:
+        return
+
+    try:
+        process.wait(timeout=1)
+    except subprocess.TimeoutExpired:
+        try:
+            process.kill()
+        except OSError:
+            return
+        try:
+            process.wait(timeout=1)
+        except (OSError, subprocess.TimeoutExpired):
+            return
+    except OSError:
+        return
+
+
+def normalize_process_status(returncode: int) -> int:
+    if os.name == "nt" and returncode in {0xC000013A, -1073741510}:
+        return 130
+    if returncode < 0:
+        return 128 + abs(returncode)
+    return returncode
 
 
 def invert_status(status: int) -> int:

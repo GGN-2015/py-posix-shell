@@ -4,6 +4,7 @@ import io
 import os
 import sys
 
+import py_posix_shell.shell as shell_module
 from py_posix_shell.lexer import dump_tokens, lex
 from py_posix_shell.errors import ShellExit
 from py_posix_shell.shell import Shell
@@ -337,6 +338,57 @@ def test_command_and_type_report_internal_utility_when_path_is_empty():
     assert stdout.splitlines()[0] == "ls"
     assert "ls is a shell utility" in stdout
     assert stderr == ""
+
+
+def test_external_keyboard_interrupt_returns_130(monkeypatch):
+    shell = Shell(stdin=io.StringIO(), stdout=io.StringIO(), stderr=io.StringIO())
+    shell.resolve_command = lambda _name, _env: "fake-more"  # type: ignore[method-assign]
+    events: list[str] = []
+
+    class FakeProcess:
+        returncode = None
+
+        def communicate(self, input=None):
+            events.append(f"communicate:{input!r}")
+            raise KeyboardInterrupt
+
+        def wait(self, timeout=None):
+            events.append(f"wait:{timeout}")
+            if timeout == 0.2:
+                raise shell_module.subprocess.TimeoutExpired("fake-more", timeout)
+            self.returncode = -2
+            return self.returncode
+
+        def terminate(self):
+            events.append("terminate")
+
+        def send_signal(self, sig):
+            events.append(f"signal:{sig}")
+
+        def kill(self):
+            events.append("kill")
+
+    monkeypatch.setattr(shell_module.subprocess, "Popen", lambda *args, **kwargs: FakeProcess())
+
+    assert shell.run_external(["more"]) == 130
+    assert "communicate:''" in events
+    assert "terminate" in events or any(event.startswith("signal:") for event in events)
+    assert shell.stderr.getvalue() == ""
+
+
+def test_repl_keyboard_interrupt_returns_to_prompt(monkeypatch):
+    stdout = io.StringIO()
+    shell = Shell(stdout=stdout, stderr=io.StringIO(), interactive=True)
+    events = iter([KeyboardInterrupt, EOFError])
+
+    def fake_input(_prompt):
+        raise next(events)
+
+    monkeypatch.setattr("builtins.input", fake_input)
+
+    assert shell.repl() == 130
+    assert shell.last_status == 130
+    assert stdout.getvalue() == "\n\n"
 
 
 def test_internal_extended_text_utilities_without_path(tmp_path):
