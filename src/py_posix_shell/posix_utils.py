@@ -171,6 +171,31 @@ def utility_clear(shell, argv: list[str], stdin: TextIO, stdout: TextIO, stderr:
     return 0
 
 
+def utility_help(shell, argv: list[str], stdin: TextIO, stdout: TextIO, stderr: TextIO) -> int:
+    from . import __version__
+
+    topics = argv[1:]
+    if not topics:
+        stdout.write(f"py-posix-shell, version {__version__}\n")
+        stdout.write("These shell commands and fallback utilities are defined internally.\n")
+        stdout.write("Type `help NAME' for a short description of NAME.\n\n")
+        write_help_table(stdout, HELP_SUMMARY_ITEMS)
+        return 0
+
+    status = 0
+    for index, topic in enumerate(topics):
+        key = topic.strip()
+        text = HELP_DETAILS.get(key)
+        if text is None:
+            stderr.write(f"help: no help topics match '{topic}'\n")
+            status = 1
+            continue
+        if index:
+            stdout.write("\n")
+        stdout.write(text.rstrip() + "\n")
+    return status
+
+
 def utility_ls(shell, argv: list[str], stdin: TextIO, stdout: TextIO, stderr: TextIO) -> int:
     show_all = False
     almost_all = False
@@ -2578,6 +2603,91 @@ def safe_extract_tar(tar: tarfile.TarFile, destination: Path, members: list[str]
         tar.extractall(destination, members=selected)
 
 
+HELP_ITEMS: tuple[tuple[str, str, str], ...] = (
+    ("!", "! PIPELINE", "Execute PIPELINE and invert its exit status."),
+    ("pipeline", "COMMAND1 | COMMAND2", "Connect stdout of COMMAND1 to stdin of COMMAND2."),
+    ("list", "COMMAND1 ; COMMAND2", "Run commands sequentially."),
+    ("and-or", "COMMAND1 && COMMAND2  /  COMMAND1 || COMMAND2", "Run commands conditionally by exit status."),
+    ("if", "if COMMANDS; then COMMANDS; [elif COMMANDS; then COMMANDS;] [else COMMANDS;] fi", "Conditional command execution."),
+    ("for", "for NAME [in WORDS ...]; do COMMANDS; done", "Loop over words or positional parameters."),
+    ("while", "while COMMANDS; do COMMANDS; done", "Loop while COMMANDS returns success."),
+    ("until", "until COMMANDS; do COMMANDS; done", "Loop until COMMANDS returns success."),
+    ("case", "case WORD in [PATTERN) COMMANDS ;;]... esac", "Pattern-based branching."),
+    ("function", "name() { COMMANDS; }", "Define a POSIX-style shell function."),
+    ("group", "{ COMMANDS; }", "Run COMMANDS in the current shell environment."),
+    ("subshell", "( COMMANDS )", "Run COMMANDS in a subshell environment."),
+    ("redirection", "[n] < > >> <> 2> 2>> >& <& WORD", "Redirect command input, output, or file descriptors."),
+    (".", ". filename [arguments]", "Read and execute commands from filename in the current shell."),
+    ("source", "source filename [arguments]", "Alias for the dot command."),
+    (":", ":", "Return success without doing anything."),
+    ("alias", "alias [name[=value] ...]", "Define or display command aliases."),
+    ("unalias", "unalias name ...", "Remove command aliases."),
+    ("cd", "cd [dir]", "Change the current directory."),
+    ("pwd", "pwd", "Print the current directory."),
+    ("echo", "echo [-n] [arg ...]", "Write arguments separated by spaces."),
+    ("printf", "printf format [arguments]", "Format and print arguments."),
+    ("read", "read [-r] [name ...]", "Read one input line into shell variables."),
+    ("eval", "eval [arg ...]", "Read arguments as shell input and execute them."),
+    ("exec", "exec [command [arg ...]]", "Replace the shell with command, or apply redirections."),
+    ("exit", "exit [n]", "Exit the shell with status n."),
+    ("return", "return [n]", "Return from a function or sourced script."),
+    ("break", "break [n]", "Exit one or more loops."),
+    ("continue", "continue [n]", "Continue one or more loops."),
+    ("export", "export [name[=value] ...] or export -p", "Mark variables for child process environments."),
+    ("readonly", "readonly [name[=value] ...] or readonly -p", "Mark variables as read-only."),
+    ("unset", "unset name ...", "Unset shell variables and environment variables."),
+    ("set", "set [-efu] [+efu] [-- arg ...]", "Set shell options or positional parameters."),
+    ("shift", "shift [n]", "Shift positional parameters."),
+    ("getopts", "getopts optstring name [arg ...]", "Parse shell option arguments."),
+    ("type", "type name ...", "Describe how each name would be interpreted."),
+    ("command", "command [-Vv] command [arg ...]", "Run a command while bypassing shell functions."),
+    ("env", "env [-i] [name=value ...] [command [arg ...]]", "Display or run with a modified environment."),
+    ("test", "test expr", "Evaluate a conditional expression."),
+    ("[", "[ expr ]", "Evaluate a conditional expression."),
+    ("trap", "trap [-lp] [[action] signal_spec ...]", "Display, set, or reset signal traps."),
+    ("umask", "umask [mode]", "Display or set the file creation mask."),
+    ("times", "times", "Display process times."),
+    ("hash", "hash [-r] [name ...]", "Remember or display command locations."),
+    ("help", "help [name ...]", "Display this help text."),
+    ("clear", "clear", "Clear the terminal using an ANSI fallback sequence."),
+    ("base64", "base64 [-d|-D] [file ...]", "Encode or decode base64 data."),
+    ("cat", "cat [file ...]", "Concatenate files to standard output."),
+    ("cp", "cp [-Rfp] source ... target", "Copy files and directories."),
+    ("cut", "cut -b|-c|-f list [file ...]", "Select byte, character, or field ranges."),
+    ("date", "date [+format]", "Display the current date and time."),
+    ("diff", "diff [-u] file1 file2", "Compare files line by line."),
+    ("find", "find [path ...] [expression]", "Walk file trees and match paths."),
+    ("grep", "grep [-EinvcqFlHh] pattern [file ...]", "Search files for matching lines."),
+    ("install", "install [-D] [-d] [-m mode] source target", "Copy files and set attributes."),
+    ("ls", "ls [-Aald1] [file ...]", "List directory contents."),
+    ("mkdir", "mkdir [-p] dir ...", "Create directories."),
+    ("mv", "mv source ... target", "Move or rename files."),
+    ("rm", "rm [-fRr] file ...", "Remove files or directories."),
+    ("sed", "sed [-n] [-e script] [script] [file ...]", "Run a stream editing script."),
+    ("sort", "sort [-fnru] [-o file] [file ...]", "Sort text lines."),
+    ("tar", "tar -cf|-xf|-tf archive [file ...]", "Create, extract, or list tar archives."),
+    ("tr", "tr [-d] set1 [set2]", "Translate or delete characters."),
+    ("wc", "wc [-lwc] [file ...]", "Count lines, words, and bytes."),
+    ("xargs", "xargs [-0] [-n count] [-I repl] [command ...]", "Build command lines from standard input."),
+)
+
+HELP_SUMMARY_ITEMS = tuple(item[1] for item in HELP_ITEMS)
+HELP_DETAILS = {name: f"{usage}\n    {description}" for name, usage, description in HELP_ITEMS}
+
+
+def write_help_table(stdout: TextIO, items: tuple[str, ...]) -> None:
+    width = 48
+    for index in range(0, len(items), 2):
+        left = items[index]
+        right = items[index + 1] if index + 1 < len(items) else ""
+        if len(left) >= width:
+            stdout.write(left + "\n")
+            if right:
+                stdout.write(f"{'':<{width}}{right}\n")
+        else:
+            stdout.write(f"{left:<{width}}{right}\n")
+
+
 def sys_argv0() -> str:
     try:
         import sys
@@ -2610,6 +2720,7 @@ INTERNAL_UTILITIES: dict[str, Utility] = {
     "gawk": utility_gawk,
     "grep": utility_grep,
     "head": utility_head,
+    "help": utility_help,
     "id": utility_id,
     "install": utility_install,
     "kill": utility_kill,

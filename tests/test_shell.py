@@ -566,6 +566,24 @@ def test_internal_clear_utility_without_path():
     assert stderr == ""
 
 
+def test_internal_help_utility_without_path():
+    status, stdout, stderr, _shell = run_shell(
+        "help; help cd; help clear; help nope; echo status:$?; command -v help; type help",
+        env={"PATH": ""},
+    )
+    assert status == 0
+    assert "py-posix-shell, version" in stdout
+    assert "These shell commands and fallback utilities are defined internally." in stdout
+    assert "if COMMANDS; then COMMANDS;" in stdout
+    assert "help [name ...]" in stdout
+    assert "cd [dir]\n    Change the current directory." in stdout
+    assert "clear\n    Clear the terminal using an ANSI fallback sequence." in stdout
+    assert "status:1\n" in stdout
+    assert "\nhelp\n" in stdout
+    assert "help is a shell utility" in stdout
+    assert "help: no help topics match 'nope'\n" == stderr
+
+
 def test_internal_findutils_and_file_install_without_path(tmp_path):
     source = tmp_path / "source.txt"
     source.write_text("payload\n", encoding="utf-8")
