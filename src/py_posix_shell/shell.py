@@ -861,6 +861,12 @@ class Shell:
                 buffer = ""
                 status = 2
                 continue
+            except KeyboardInterrupt:
+                self.stdout.write("\n")
+                buffer = ""
+                status = 130
+                self.last_status = status
+                continue
             try:
                 status = self.execute(candidate)
             except ShellExit as exc:

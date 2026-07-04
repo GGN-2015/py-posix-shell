@@ -379,16 +379,19 @@ def test_external_keyboard_interrupt_returns_130(monkeypatch):
 def test_repl_keyboard_interrupt_returns_to_prompt(monkeypatch):
     stdout = io.StringIO()
     shell = Shell(stdout=stdout, stderr=io.StringIO(), interactive=True)
-    events = iter([KeyboardInterrupt, EOFError])
+    events = iter([KeyboardInterrupt, "echo after:$?", EOFError])
 
     def fake_input(_prompt):
-        raise next(events)
+        event = next(events)
+        if isinstance(event, type) and issubclass(event, BaseException):
+            raise event
+        return event
 
     monkeypatch.setattr("builtins.input", fake_input)
 
-    assert shell.repl() == 130
-    assert shell.last_status == 130
-    assert stdout.getvalue() == "\n\n"
+    assert shell.repl() == 0
+    assert shell.last_status == 0
+    assert stdout.getvalue() == "\nafter:130\n\n"
 
 
 def test_internal_extended_text_utilities_without_path(tmp_path):
