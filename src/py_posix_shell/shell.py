@@ -1196,6 +1196,8 @@ class Shell:
             return True
         if name == "vi" and os.name != "nt":
             return False
+        if name == "ps" and os.name != "nt":
+            return False
         return self.resolve_command(name, env) is None
 
     def run_exit_trap(self) -> None:

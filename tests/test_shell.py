@@ -1,14 +1,16 @@
 from __future__ import annotations
 
 import base64
+import datetime as dt
 import io
 import os
 import sys
 
+import py_posix_shell.posix_utils as posix_utils
 import py_posix_shell.shell as shell_module
 from py_posix_shell.lexer import dump_tokens, lex
 from py_posix_shell.errors import ShellExit
-from py_posix_shell.posix_utils import WindowsViEditor
+from py_posix_shell.posix_utils import ProcessInfo, StorageVolume, WindowsViEditor
 from py_posix_shell.shell import LineHistoryState, Shell
 
 
@@ -324,14 +326,94 @@ dirname "{moved}"
 
 
 def test_internal_process_and_identity_utilities_without_path():
+    command = "ps; uname -s; whoami; id; date +%Y" if os.name == "nt" else "uname -s; whoami; id; date +%Y"
     status, stdout, stderr, _shell = run_shell(
-        "ps; uname -s; whoami; id; date +%Y",
+        command,
         env={"PATH": ""},
     )
     assert status == 0
-    assert "PID COMMAND\n" in stdout
-    assert stdout.count("\n") >= 5
+    if os.name == "nt":
+        assert stdout.splitlines()[0].split() == ["PID", "TTY", "TIME", "CMD"]
+        assert stdout.count("\n") >= 5
+    else:
+        assert stdout.count("\n") >= 4
     assert stderr == ""
+
+
+def test_windows_ps_formats_linux_style_process_views(monkeypatch):
+    now = dt.datetime.now()
+    current_pid = os.getpid()
+    fake_processes = [
+        ProcessInfo(
+            pid=current_pid,
+            ppid=10,
+            user="DESKTOP\\neko",
+            tty="?",
+            cpu_seconds=65,
+            start_time=now - dt.timedelta(minutes=10),
+            cmd="pysh.exe",
+            name="pysh.exe",
+            rss=50 * 1024 * 1024,
+            virtual_size=100 * 1024 * 1024,
+            state="R",
+        ),
+        ProcessInfo(
+            pid=current_pid + 1,
+            ppid=current_pid,
+            user="DESKTOP\\neko",
+            tty="?",
+            cpu_seconds=3,
+            start_time=now - dt.timedelta(minutes=2),
+            cmd='python.exe child.py',
+            name="python.exe",
+            rss=20 * 1024 * 1024,
+            virtual_size=80 * 1024 * 1024,
+        ),
+        ProcessInfo(
+            pid=99999,
+            ppid=4,
+            user="NT AUTHORITY\\SYSTEM",
+            tty="?",
+            cpu_seconds=9,
+            start_time=now - dt.timedelta(days=1),
+            cmd="services.exe",
+            name="services.exe",
+            rss=10 * 1024 * 1024,
+            virtual_size=60 * 1024 * 1024,
+        ),
+    ]
+
+    monkeypatch.setattr(posix_utils.os, "name", "nt")
+    monkeypatch.setattr(posix_utils, "collect_windows_processes", lambda *, detailed: fake_processes)
+    monkeypatch.setattr(posix_utils, "windows_total_physical_memory", lambda: 200 * 1024 * 1024)
+
+    status, stdout, stderr, _shell = run_shell("ps; ps -ef; ps aux; ps --help", env={"PATH": ""})
+
+    assert status == 0
+    assert stdout.splitlines()[0].split() == ["PID", "TTY", "TIME", "CMD"]
+    default_section = stdout.split("UID", 1)[0]
+    assert "pysh.exe" in default_section
+    assert "python.exe" in default_section
+    assert "services.exe" not in default_section
+    assert "UID" in stdout
+    assert "PPID" in stdout
+    assert "STIME" in stdout
+    assert "DESKTOP\\neko" in stdout
+    assert "python.exe child.py" in stdout
+    assert "USER" in stdout
+    assert "%CPU" in stdout
+    assert "%MEM" in stdout
+    assert "COMMAND" in stdout
+    assert "services.exe" in stdout
+    assert "Usage: ps [aux|-ef]\n" in stdout
+    assert stderr == ""
+
+
+def test_ps_internal_fallback_is_windows_only(monkeypatch):
+    monkeypatch.setattr(shell_module.os, "name", "posix")
+    shell = Shell(env={"PATH": ""})
+
+    assert shell.should_run_internal_utility("ps", shell.env) is False
 
 
 def test_command_and_type_report_internal_utility_when_path_is_empty():
@@ -683,6 +765,52 @@ def test_internal_clear_utility_without_path():
     assert stderr == ""
 
 
+def test_internal_df_and_lsblk_storage_fallback(monkeypatch):
+    gib = 1024**3
+    fake_volume = StorageVolume(
+        device="C:",
+        mountpoint="C:\\",
+        fstype="NTFS",
+        label="System",
+        total=100 * gib,
+        used=40 * gib,
+        free=60 * gib,
+        drive_type="fixed",
+        serial="ABCD1234",
+    )
+
+    def fake_collect(paths=None):
+        assert paths in (None, ["C:/"])
+        return [fake_volume]
+
+    monkeypatch.setattr(posix_utils, "collect_storage_volumes", fake_collect)
+
+    status, stdout, stderr, _shell = run_shell(
+        "df -h; df -T C:/; lsblk; lsblk -f; lsblk -b -o NAME,SIZE,FSAVAIL,FSUSE%,MOUNTPOINTS",
+        env={"PATH": ""},
+    )
+
+    assert status == 0
+    assert "Filesystem Size Used Avail Use% Mounted on\n" in stdout
+    assert "C:" in stdout
+    assert "100G  40G   60G  40% C:\\" in stdout
+    assert "Filesystem Type 1K-blocks Used     Available Use% Mounted on\n" in stdout
+    assert "104857600" in stdout
+    assert "41943040" in stdout
+    assert "62914560" in stdout
+    assert "NAME" in stdout
+    assert "MAJ:MIN" in stdout
+    assert "MOUNTPOINTS" in stdout
+    assert "sda" in stdout
+    assert "\u2514\u2500sda1" in stdout
+    assert "NTFS" in stdout
+    assert "System" in stdout
+    assert "ABCD1234" in stdout
+    assert "107374182400" in stdout
+    assert "64424509440" in stdout
+    assert stderr == ""
+
+
 def test_internal_help_utility_without_path():
     status, stdout, stderr, _shell = run_shell(
         "help; help cd; help clear; help nope; echo status:$?; command -v help; type help",
@@ -694,6 +822,7 @@ def test_internal_help_utility_without_path():
     assert "if COMMANDS; then COMMANDS;" in stdout
     assert "help [name ...]" in stdout
     assert "history [-c] [-d offset] [n]" in stdout
+    assert "ps [aux|-ef]" in stdout
     assert "cd [dir]\n    Change the current directory." in stdout
     assert "clear\n    Clear the terminal using an ANSI fallback sequence." in stdout
     assert "status:1\n" in stdout

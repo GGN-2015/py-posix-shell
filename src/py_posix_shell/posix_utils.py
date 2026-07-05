@@ -9,6 +9,7 @@ import datetime as _datetime
 import difflib
 import fnmatch
 import getpass
+import json
 import os
 import platform
 import re
@@ -35,6 +36,36 @@ except ImportError:  # pragma: no cover - Windows
 
 
 Utility = Callable[[object, list[str], TextIO, TextIO, TextIO], int]
+
+
+@dataclass(frozen=True)
+class StorageVolume:
+    device: str
+    mountpoint: str
+    fstype: str
+    label: str
+    total: int
+    used: int
+    free: int
+    drive_type: str = "disk"
+    removable: bool = False
+    readonly: bool = False
+    serial: str = ""
+
+
+@dataclass(frozen=True)
+class ProcessInfo:
+    pid: int
+    ppid: int
+    user: str
+    tty: str
+    cpu_seconds: float
+    start_time: _datetime.datetime | None
+    cmd: str
+    name: str
+    rss: int = 0
+    virtual_size: int = 0
+    state: str = "S"
 
 
 def utility_cat(shell, argv: list[str], stdin: TextIO, stdout: TextIO, stderr: TextIO) -> int:
@@ -168,6 +199,176 @@ def utility_clear(shell, argv: list[str], stdin: TextIO, stdout: TextIO, stderr:
         stdout.flush()
     except OSError:
         pass
+    return 0
+
+
+def utility_df(shell, argv: list[str], stdin: TextIO, stdout: TextIO, stderr: TextIO) -> int:
+    del shell, stdin
+    human = False
+    show_type = False
+    total_row = False
+    block_size = 1024
+    block_header = "1K-blocks"
+    paths: list[str] = []
+    index = 1
+    while index < len(argv):
+        arg = argv[index]
+        if arg == "--":
+            paths.extend(argv[index + 1 :])
+            break
+        if arg == "--help":
+            stdout.write("Usage: df [-hkmPT] [file ...]\n")
+            return 0
+        if arg == "--human-readable":
+            human = True
+        elif arg == "--total":
+            total_row = True
+        elif arg.startswith("--block-size="):
+            parsed = parse_size_argument(arg.split("=", 1)[1])
+            if parsed is None:
+                stderr.write(f"df: invalid block size: {arg.split('=', 1)[1]}\n")
+                return 2
+            block_size = parsed
+            block_header = f"{block_size}-blocks"
+        elif arg == "-B" or arg == "--block-size":
+            index += 1
+            if index >= len(argv):
+                stderr.write("df: option requires an argument -- B\n")
+                return 2
+            parsed = parse_size_argument(argv[index])
+            if parsed is None:
+                stderr.write(f"df: invalid block size: {argv[index]}\n")
+                return 2
+            block_size = parsed
+            block_header = f"{block_size}-blocks"
+        elif arg.startswith("-B") and len(arg) > 2:
+            parsed = parse_size_argument(arg[2:])
+            if parsed is None:
+                stderr.write(f"df: invalid block size: {arg[2:]}\n")
+                return 2
+            block_size = parsed
+            block_header = f"{block_size}-blocks"
+        elif arg.startswith("-") and arg != "-":
+            for flag in arg[1:]:
+                if flag == "h":
+                    human = True
+                elif flag == "k":
+                    block_size = 1024
+                    block_header = "1K-blocks"
+                elif flag == "m":
+                    block_size = 1024 * 1024
+                    block_header = "1M-blocks"
+                elif flag in {"P", "a"}:
+                    pass
+                elif flag == "T":
+                    show_type = True
+                else:
+                    stderr.write(f"df: invalid option -- {flag}\n")
+                    return 2
+        else:
+            paths.append(arg)
+        index += 1
+
+    try:
+        volumes = collect_storage_volumes(paths or None)
+    except OSError as exc:
+        stderr.write(f"df: {exc.filename or ''}: {exc.strerror or exc}\n")
+        return 1
+
+    headers = ["Filesystem"]
+    if show_type:
+        headers.append("Type")
+    headers.extend(["Size", "Used", "Avail", "Use%", "Mounted on"] if human else [block_header, "Used", "Available", "Use%", "Mounted on"])
+    rows: list[list[str]] = []
+    total = used = free = 0
+    for volume in volumes:
+        total += volume.total
+        used += volume.used
+        free += volume.free
+        rows.append(format_df_row(volume, human=human, show_type=show_type, block_size=block_size))
+    if total_row and volumes:
+        rows.append(
+            format_df_row(
+                StorageVolume("total", "total", "", "", total, used, free),
+                human=human,
+                show_type=show_type,
+                block_size=block_size,
+            )
+        )
+    write_aligned_table(stdout, headers, rows, right_align={"Size", "Used", "Avail", "Available", block_header, "Use%"})
+    return 0
+
+
+def utility_lsblk(shell, argv: list[str], stdin: TextIO, stdout: TextIO, stderr: TextIO) -> int:
+    del shell, stdin
+    fs_mode = False
+    bytes_mode = False
+    no_headings = False
+    no_deps = False
+    ascii_tree = False
+    columns: list[str] | None = None
+    index = 1
+    while index < len(argv):
+        arg = argv[index]
+        if arg == "--":
+            break
+        if arg == "--help":
+            stdout.write("Usage: lsblk [-bdfin] [-o column[,column...]]\n")
+            return 0
+        if arg in {"-o", "--output"}:
+            index += 1
+            if index >= len(argv):
+                stderr.write("lsblk: option requires an argument -- o\n")
+                return 2
+            columns = parse_lsblk_columns(argv[index])
+        elif arg.startswith("--output="):
+            columns = parse_lsblk_columns(arg.split("=", 1)[1])
+        elif arg.startswith("-") and arg != "-":
+            for flag in arg[1:]:
+                if flag == "f":
+                    fs_mode = True
+                elif flag == "b":
+                    bytes_mode = True
+                elif flag == "d":
+                    no_deps = True
+                elif flag == "n":
+                    no_headings = True
+                elif flag == "i":
+                    ascii_tree = True
+                elif flag == "o":
+                    stderr.write("lsblk: option requires an argument -- o\n")
+                    return 2
+                else:
+                    stderr.write(f"lsblk: invalid option -- {flag}\n")
+                    return 2
+        else:
+            stderr.write(f"lsblk: unexpected operand: {arg}\n")
+            return 2
+        index += 1
+
+    if columns is None:
+        columns = ["NAME", "FSTYPE", "LABEL", "UUID", "FSAVAIL", "FSUSE%", "MOUNTPOINTS"] if fs_mode else [
+            "NAME",
+            "MAJ:MIN",
+            "RM",
+            "SIZE",
+            "RO",
+            "TYPE",
+            "MOUNTPOINTS",
+        ]
+    unknown = [column for column in columns if column not in LSBLK_COLUMN_NAMES]
+    if unknown:
+        stderr.write(f"lsblk: unknown column: {unknown[0]}\n")
+        return 2
+
+    try:
+        volumes = collect_storage_volumes(None)
+    except OSError as exc:
+        stderr.write(f"lsblk: {exc.strerror or exc}\n")
+        return 1
+
+    rows = build_lsblk_rows(volumes, columns, bytes_mode=bytes_mode, no_deps=no_deps, ascii_tree=ascii_tree)
+    write_aligned_table(stdout, [] if no_headings else columns, rows, right_align={"MAJ:MIN", "RM", "SIZE", "RO", "FSAVAIL", "FSUSE%"})
     return 0
 
 
@@ -776,24 +977,30 @@ def utility_touch(shell, argv: list[str], stdin: TextIO, stdout: TextIO, stderr:
 
 
 def utility_ps(shell, argv: list[str], stdin: TextIO, stdout: TextIO, stderr: TextIO) -> int:
-    stdout.write("  PID COMMAND\n")
-    if os.name == "nt":
-        try:
-            completed = subprocess.run(
-                ["tasklist", "/FO", "CSV", "/NH"],
-                text=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
-            )
-        except OSError:
-            completed = None
-        if completed and completed.returncode == 0:
-            for line in completed.stdout.splitlines()[:200]:
-                parts = parse_csv_line(line)
-                if len(parts) >= 2:
-                    stdout.write(f"{parts[1]:>5} {parts[0]}\n")
-            return 0
-    stdout.write(f"{os.getpid():>5} {Path(sys_argv0()).name or 'python'}\n")
+    if os.name != "nt":
+        stderr.write("ps: fallback implementation is only available on Windows\n")
+        return 127
+
+    mode = parse_ps_mode(argv, stderr)
+    if mode is None:
+        return 2
+    if mode == "help":
+        stdout.write("Usage: ps [aux|-ef]\n")
+        return 0
+    detailed = mode in {"ef", "aux"}
+    processes = collect_windows_processes(detailed=detailed)
+    if not processes:
+        processes = [current_process_info()]
+    tty = "con" if stream_is_tty(stdin) or stream_is_tty(stdout) else "?"
+    if mode == "default":
+        selected = filter_current_process_tree(processes, os.getpid())
+        if not selected:
+            selected = [current_process_info()]
+        write_ps_default(stdout, selected, tty)
+    elif mode == "ef":
+        write_ps_ef(stdout, processes, tty)
+    else:
+        write_ps_aux(stdout, processes, tty)
     return 0
 
 
@@ -2945,6 +3152,855 @@ def safe_extract_tar(tar: tarfile.TarFile, destination: Path, members: list[str]
         tar.extractall(destination, members=selected)
 
 
+def parse_ps_mode(argv: list[str], stderr: TextIO) -> str | None:
+    if len(argv) == 1:
+        return "default"
+    saw_all = False
+    saw_full = False
+    bsd_flags = ""
+    for arg in argv[1:]:
+        if arg == "--":
+            break
+        if arg in {"--help"}:
+            return "help"
+        if arg in {"aux", "axu", "uxa"}:
+            return "aux"
+        if arg.startswith("-") and arg != "-":
+            flags = arg[1:]
+            if set(flags) <= {"a", "u", "x"} and {"a", "u", "x"}.issubset(set(flags)):
+                return "aux"
+            for flag in flags:
+                if flag in {"e", "A"}:
+                    saw_all = True
+                elif flag == "f":
+                    saw_full = True
+                else:
+                    stderr.write(f"ps: unsupported option -- {flag}\n")
+                    return None
+        elif set(arg) <= {"a", "u", "x"}:
+            bsd_flags += arg
+            if {"a", "u", "x"}.issubset(set(bsd_flags)):
+                return "aux"
+        else:
+            stderr.write(f"ps: unsupported operand: {arg}\n")
+            return None
+    if saw_all and saw_full:
+        return "ef"
+    if saw_all:
+        return "ef"
+    if saw_full:
+        return "ef"
+    return "default"
+
+
+def collect_windows_processes(*, detailed: bool) -> list[ProcessInfo]:
+    if os.name != "nt":
+        return []
+    if detailed:
+        processes = collect_windows_processes_powershell()
+        if processes:
+            return processes
+    processes = collect_windows_processes_toolhelp()
+    return processes or [current_process_info()]
+
+
+def collect_windows_processes_powershell() -> list[ProcessInfo]:
+    powershell = find_powershell_executable()
+    if not powershell:
+        return []
+    script = r"""
+$ErrorActionPreference = 'SilentlyContinue'
+[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new()
+Get-CimInstance Win32_Process | ForEach-Object {
+  $owner = ''
+  try {
+    $o = Invoke-CimMethod -InputObject $_ -MethodName GetOwner -ErrorAction Stop
+    if ($o.User) {
+      if ($o.Domain) { $owner = "$($o.Domain)\$($o.User)" } else { $owner = $o.User }
+    }
+  } catch {}
+  [PSCustomObject]@{
+    PID = [int]$_.ProcessId
+    PPID = [int]$_.ParentProcessId
+    Name = [string]$_.Name
+    CommandLine = [string]$_.CommandLine
+    Owner = [string]$owner
+    CreationDate = if ($_.CreationDate) { $_.CreationDate.ToString('o') } else { '' }
+    KernelModeTime = [string]$_.KernelModeTime
+    UserModeTime = [string]$_.UserModeTime
+    WorkingSetSize = [string]$_.WorkingSetSize
+    VirtualSize = [string]$_.VirtualSize
+  }
+} | ConvertTo-Json -Compress -Depth 3
+"""
+    try:
+        completed = subprocess.run(
+            [powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script],
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=12,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    if completed.returncode != 0 or not completed.stdout.strip():
+        return []
+    return parse_windows_process_json(completed.stdout)
+
+
+def find_powershell_executable() -> str | None:
+    candidates = [
+        os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "WindowsPowerShell", "v1.0", "powershell.exe"),
+        shutil.which("powershell.exe"),
+        shutil.which("pwsh.exe"),
+    ]
+    for candidate in dict.fromkeys(item for item in candidates if item):
+        if candidate and os.path.exists(candidate):
+            return candidate
+    return None
+
+
+def parse_windows_process_json(text: str) -> list[ProcessInfo]:
+    try:
+        raw = json.loads(text)
+    except json.JSONDecodeError:
+        return []
+    items = raw if isinstance(raw, list) else [raw]
+    processes: list[ProcessInfo] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        pid = safe_int(item.get("PID"))
+        if pid <= 0:
+            continue
+        name = str(item.get("Name") or "")
+        command = str(item.get("CommandLine") or name or f"pid-{pid}")
+        kernel_time = safe_int(item.get("KernelModeTime"))
+        user_time = safe_int(item.get("UserModeTime"))
+        owner = str(item.get("Owner") or "?")
+        processes.append(
+            ProcessInfo(
+                pid=pid,
+                ppid=max(0, safe_int(item.get("PPID"))),
+                user=owner,
+                tty="?",
+                cpu_seconds=(kernel_time + user_time) / 10_000_000,
+                start_time=parse_process_datetime(str(item.get("CreationDate") or "")),
+                cmd=command,
+                name=name or command_name(command),
+                rss=max(0, safe_int(item.get("WorkingSetSize"))),
+                virtual_size=max(0, safe_int(item.get("VirtualSize"))),
+            )
+        )
+    return sorted(processes, key=lambda process: process.pid)
+
+
+def collect_windows_processes_toolhelp() -> list[ProcessInfo]:
+    if os.name != "nt":
+        return []
+    try:
+        import ctypes
+        from ctypes import wintypes
+    except ImportError:
+        return []
+
+    class ProcessEntry32(ctypes.Structure):
+        _fields_ = [
+            ("dwSize", wintypes.DWORD),
+            ("cntUsage", wintypes.DWORD),
+            ("th32ProcessID", wintypes.DWORD),
+            ("th32DefaultHeapID", ctypes.c_void_p),
+            ("th32ModuleID", wintypes.DWORD),
+            ("cntThreads", wintypes.DWORD),
+            ("th32ParentProcessID", wintypes.DWORD),
+            ("pcPriClassBase", ctypes.c_long),
+            ("dwFlags", wintypes.DWORD),
+            ("szExeFile", ctypes.c_wchar * 260),
+        ]
+
+    kernel32 = ctypes.windll.kernel32
+    kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+    kernel32.Process32FirstW.argtypes = [wintypes.HANDLE, ctypes.POINTER(ProcessEntry32)]
+    kernel32.Process32NextW.argtypes = [wintypes.HANDLE, ctypes.POINTER(ProcessEntry32)]
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    snapshot = kernel32.CreateToolhelp32Snapshot(0x00000002, 0)
+    if snapshot == ctypes.c_void_p(-1).value:
+        return []
+    entry = ProcessEntry32()
+    entry.dwSize = ctypes.sizeof(entry)
+    processes: list[ProcessInfo] = []
+    default_user = getpass.getuser()
+    try:
+        ok = kernel32.Process32FirstW(snapshot, ctypes.byref(entry))
+        while ok:
+            pid = int(entry.th32ProcessID)
+            name = entry.szExeFile or f"pid-{pid}"
+            cpu_seconds, start_time = windows_process_times(pid)
+            processes.append(
+                ProcessInfo(
+                    pid=pid,
+                    ppid=max(0, int(entry.th32ParentProcessID)),
+                    user=default_user,
+                    tty="?",
+                    cpu_seconds=cpu_seconds,
+                    start_time=start_time,
+                    cmd=name,
+                    name=name,
+                )
+            )
+            ok = kernel32.Process32NextW(snapshot, ctypes.byref(entry))
+    finally:
+        kernel32.CloseHandle(snapshot)
+    return sorted(processes, key=lambda process: process.pid)
+
+
+def windows_process_times(pid: int) -> tuple[float, _datetime.datetime | None]:
+    try:
+        import ctypes
+        from ctypes import wintypes
+    except ImportError:
+        return 0.0, None
+    kernel32 = ctypes.windll.kernel32
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.GetProcessTimes.argtypes = [
+        wintypes.HANDLE,
+        ctypes.POINTER(wintypes.FILETIME),
+        ctypes.POINTER(wintypes.FILETIME),
+        ctypes.POINTER(wintypes.FILETIME),
+        ctypes.POINTER(wintypes.FILETIME),
+    ]
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    handle = kernel32.OpenProcess(0x1000, False, pid)
+    if not handle:
+        return 0.0, None
+    creation = wintypes.FILETIME()
+    exit_time = wintypes.FILETIME()
+    kernel = wintypes.FILETIME()
+    user = wintypes.FILETIME()
+    try:
+        if not kernel32.GetProcessTimes(
+            handle,
+            ctypes.byref(creation),
+            ctypes.byref(exit_time),
+            ctypes.byref(kernel),
+            ctypes.byref(user),
+        ):
+            return 0.0, None
+    finally:
+        kernel32.CloseHandle(handle)
+    cpu_seconds = (filetime_to_int(kernel) + filetime_to_int(user)) / 10_000_000
+    return cpu_seconds, datetime_from_filetime(filetime_to_int(creation))
+
+
+def filetime_to_int(value) -> int:
+    return (int(value.dwHighDateTime) << 32) + int(value.dwLowDateTime)
+
+
+def datetime_from_filetime(value: int) -> _datetime.datetime | None:
+    if value <= 0:
+        return None
+    return _datetime.datetime(1601, 1, 1) + _datetime.timedelta(microseconds=value // 10)
+
+
+def current_process_info() -> ProcessInfo:
+    cpu = sum(os.times()[:2])
+    name = Path(sys_argv0()).name or "python"
+    return ProcessInfo(
+        pid=os.getpid(),
+        ppid=0,
+        user=getpass.getuser(),
+        tty="?",
+        cpu_seconds=cpu,
+        start_time=None,
+        cmd=name,
+        name=name,
+        state="R",
+    )
+
+
+def filter_current_process_tree(processes: list[ProcessInfo], root_pid: int) -> list[ProcessInfo]:
+    by_parent: dict[int, list[ProcessInfo]] = {}
+    by_pid = {process.pid: process for process in processes}
+    for process in processes:
+        by_parent.setdefault(process.ppid, []).append(process)
+    selected: dict[int, ProcessInfo] = {}
+    if root_pid in by_pid:
+        selected[root_pid] = by_pid[root_pid]
+    stack = [root_pid]
+    while stack:
+        pid = stack.pop()
+        for child in by_parent.get(pid, []):
+            if child.pid in selected:
+                continue
+            selected[child.pid] = child
+            stack.append(child.pid)
+    return sorted(selected.values(), key=lambda process: process.pid)
+
+
+def write_ps_default(stdout: TextIO, processes: list[ProcessInfo], tty: str) -> None:
+    rows = [
+        [str(process.pid), process.tty if process.tty != "?" else tty, format_cpu_time(process.cpu_seconds), process.name or command_name(process.cmd)]
+        for process in processes
+    ]
+    write_aligned_table(stdout, ["PID", "TTY", "TIME", "CMD"], rows, right_align={"PID", "TIME"})
+
+
+def write_ps_ef(stdout: TextIO, processes: list[ProcessInfo], tty: str) -> None:
+    rows = []
+    for process in sorted(processes, key=lambda item: item.pid):
+        rows.append(
+            [
+                process.user or "?",
+                str(process.pid),
+                str(process.ppid),
+                str(int(cpu_percent(process))),
+                format_start_time(process.start_time),
+                process.tty if process.tty != "?" else tty,
+                format_cpu_time(process.cpu_seconds),
+                process.cmd or process.name,
+            ]
+        )
+    write_aligned_table(stdout, ["UID", "PID", "PPID", "C", "STIME", "TTY", "TIME", "CMD"], rows, right_align={"PID", "PPID", "C", "TIME"})
+
+
+def write_ps_aux(stdout: TextIO, processes: list[ProcessInfo], tty: str) -> None:
+    total_memory = windows_total_physical_memory()
+    rows = []
+    for process in sorted(processes, key=lambda item: item.pid):
+        rows.append(
+            [
+                process.user or "?",
+                str(process.pid),
+                f"{cpu_percent(process):.1f}",
+                f"{memory_percent(process.rss, total_memory):.1f}",
+                str(max(process.virtual_size, process.rss) // 1024),
+                str(process.rss // 1024),
+                process.tty if process.tty != "?" else tty,
+                process.state or "S",
+                format_start_time(process.start_time),
+                format_cpu_time(process.cpu_seconds),
+                process.cmd or process.name,
+            ]
+        )
+    write_aligned_table(
+        stdout,
+        ["USER", "PID", "%CPU", "%MEM", "VSZ", "RSS", "TTY", "STAT", "START", "TIME", "COMMAND"],
+        rows,
+        right_align={"PID", "%CPU", "%MEM", "VSZ", "RSS", "TIME"},
+    )
+
+
+def safe_int(value: Any) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def command_name(command: str) -> str:
+    command = command.strip()
+    if not command:
+        return ""
+    try:
+        return Path(shlex.split(command, posix=False)[0].strip('"')).name
+    except (ValueError, IndexError):
+        return Path(command.split()[0].strip('"')).name if command.split() else command
+
+
+def parse_process_datetime(value: str) -> _datetime.datetime | None:
+    value = value.strip()
+    if not value:
+        return None
+    if value.startswith("/Date("):
+        match = re.search(r"-?\d+", value)
+        if match:
+            return _datetime.datetime.fromtimestamp(int(match.group()) / 1000)
+    if re.fullmatch(r"\d{14}\.\d{6}[+-]\d{3}", value):
+        value = value[:26]
+        try:
+            return _datetime.datetime.strptime(value, "%Y%m%d%H%M%S.%f")
+        except ValueError:
+            return None
+    try:
+        parsed = _datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone().replace(tzinfo=None)
+    return parsed
+
+
+def format_cpu_time(seconds: float) -> str:
+    total = max(0, int(seconds))
+    hours, remainder = divmod(total, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+
+def format_start_time(value: _datetime.datetime | None) -> str:
+    if value is None:
+        return "-"
+    now = _datetime.datetime.now()
+    if value.date() == now.date():
+        return value.strftime("%H:%M")
+    return value.strftime("%b%d")
+
+
+def cpu_percent(process: ProcessInfo) -> float:
+    if process.start_time is None:
+        return 0.0
+    elapsed = max((_datetime.datetime.now() - process.start_time).total_seconds(), 1.0)
+    return min(999.9, max(0.0, process.cpu_seconds / elapsed / max(os.cpu_count() or 1, 1) * 100))
+
+
+def memory_percent(rss: int, total_memory: int) -> float:
+    if total_memory <= 0:
+        return 0.0
+    return max(0.0, rss / total_memory * 100)
+
+
+def windows_total_physical_memory() -> int:
+    if os.name != "nt":
+        return 0
+    try:
+        import ctypes
+    except ImportError:
+        return 0
+
+    class MemoryStatusEx(ctypes.Structure):
+        _fields_ = [
+            ("dwLength", ctypes.c_ulong),
+            ("dwMemoryLoad", ctypes.c_ulong),
+            ("ullTotalPhys", ctypes.c_ulonglong),
+            ("ullAvailPhys", ctypes.c_ulonglong),
+            ("ullTotalPageFile", ctypes.c_ulonglong),
+            ("ullAvailPageFile", ctypes.c_ulonglong),
+            ("ullTotalVirtual", ctypes.c_ulonglong),
+            ("ullAvailVirtual", ctypes.c_ulonglong),
+            ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+        ]
+
+    status = MemoryStatusEx()
+    status.dwLength = ctypes.sizeof(status)
+    if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+        return 0
+    return int(status.ullTotalPhys)
+
+
+LSBLK_COLUMN_NAMES = {
+    "NAME",
+    "KNAME",
+    "MAJ:MIN",
+    "RM",
+    "SIZE",
+    "RO",
+    "TYPE",
+    "MOUNTPOINT",
+    "MOUNTPOINTS",
+    "FSTYPE",
+    "LABEL",
+    "UUID",
+    "FSAVAIL",
+    "FSUSE%",
+    "MODEL",
+}
+
+
+def collect_storage_volumes(paths: list[str] | None = None) -> list[StorageVolume]:
+    if paths:
+        return [collect_storage_volume_for_path(path) for path in paths]
+    if os.name == "nt":
+        volumes = collect_windows_storage_volumes()
+        if volumes:
+            return volumes
+    volumes = collect_posix_storage_volumes()
+    if volumes:
+        return volumes
+    return [collect_storage_volume_for_path(os.getcwd())]
+
+
+def collect_storage_volume_for_path(path: str) -> StorageVolume:
+    if not os.path.exists(path):
+        raise FileNotFoundError(2, "No such file or directory", path)
+    if os.name == "nt":
+        return windows_storage_volume_from_root(windows_root_for_path(path))
+    mountpoint = find_mountpoint(path)
+    usage = shutil.disk_usage(mountpoint)
+    device, fstype = posix_mount_metadata(mountpoint)
+    return StorageVolume(
+        device=device or mountpoint,
+        mountpoint=mountpoint,
+        fstype=fstype,
+        label="",
+        total=usage.total,
+        used=usage.used,
+        free=usage.free,
+    )
+
+
+def collect_windows_storage_volumes() -> list[StorageVolume]:
+    volumes: list[StorageVolume] = []
+    for root in windows_logical_drive_roots():
+        try:
+            volumes.append(windows_storage_volume_from_root(root))
+        except OSError:
+            continue
+    return sorted(volumes, key=lambda volume: volume.mountpoint.lower())
+
+
+def windows_logical_drive_roots() -> list[str]:
+    if os.name != "nt":
+        return []
+    try:
+        import ctypes
+    except ImportError:
+        return []
+    mask = ctypes.windll.kernel32.GetLogicalDrives()
+    return [f"{chr(ord('A') + index)}:\\" for index in range(26) if mask & (1 << index)]
+
+
+def windows_storage_volume_from_root(root: str) -> StorageVolume:
+    usage = shutil.disk_usage(root)
+    fstype, label, serial, readonly = windows_volume_metadata(root)
+    drive_type, removable = windows_drive_type(root)
+    return StorageVolume(
+        device=root.rstrip("\\/") or root,
+        mountpoint=root,
+        fstype=fstype,
+        label=label,
+        total=usage.total,
+        used=usage.used,
+        free=usage.free,
+        drive_type=drive_type,
+        removable=removable,
+        readonly=readonly,
+        serial=serial,
+    )
+
+
+def windows_root_for_path(path: str) -> str:
+    absolute = os.path.abspath(path)
+    anchor = Path(absolute).anchor
+    if anchor:
+        return anchor
+    drive, _tail = os.path.splitdrive(absolute)
+    return drive + "\\" if drive else absolute
+
+
+def windows_volume_metadata(root: str) -> tuple[str, str, str, bool]:
+    if os.name != "nt":
+        return "", "", "", False
+    try:
+        import ctypes
+    except ImportError:
+        return "", "", "", False
+    kernel32 = ctypes.windll.kernel32
+    label_buffer = ctypes.create_unicode_buffer(261)
+    fs_buffer = ctypes.create_unicode_buffer(261)
+    serial = ctypes.c_uint32()
+    max_component = ctypes.c_uint32()
+    flags = ctypes.c_uint32()
+    ok = kernel32.GetVolumeInformationW(
+        root,
+        label_buffer,
+        len(label_buffer),
+        ctypes.byref(serial),
+        ctypes.byref(max_component),
+        ctypes.byref(flags),
+        fs_buffer,
+        len(fs_buffer),
+    )
+    if not ok:
+        return "", "", "", False
+    readonly = bool(flags.value & 0x00080000)
+    return fs_buffer.value, label_buffer.value, f"{serial.value:08X}", readonly
+
+
+def windows_drive_type(root: str) -> tuple[str, bool]:
+    if os.name != "nt":
+        return "disk", False
+    try:
+        import ctypes
+    except ImportError:
+        return "disk", False
+    code = ctypes.windll.kernel32.GetDriveTypeW(root)
+    names = {
+        0: "unknown",
+        1: "unknown",
+        2: "removable",
+        3: "fixed",
+        4: "network",
+        5: "rom",
+        6: "ram",
+    }
+    return names.get(code, "unknown"), code in {2, 5}
+
+
+def collect_posix_storage_volumes() -> list[StorageVolume]:
+    mounts_path = Path("/proc/self/mounts")
+    if not mounts_path.exists():
+        mounts_path = Path("/proc/mounts")
+    if not mounts_path.exists():
+        return []
+    volumes: list[StorageVolume] = []
+    seen: set[str] = set()
+    try:
+        lines = mounts_path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return []
+    for line in lines:
+        parts = line.split()
+        if len(parts) < 3:
+            continue
+        device = unescape_mount_field(parts[0])
+        mountpoint = unescape_mount_field(parts[1])
+        fstype = unescape_mount_field(parts[2])
+        if mountpoint in seen:
+            continue
+        try:
+            usage = shutil.disk_usage(mountpoint)
+        except OSError:
+            continue
+        seen.add(mountpoint)
+        volumes.append(StorageVolume(device, mountpoint, fstype, "", usage.total, usage.used, usage.free))
+    return sorted(volumes, key=lambda volume: volume.mountpoint)
+
+
+def posix_mount_metadata(mountpoint: str) -> tuple[str, str]:
+    for volume in collect_posix_storage_volumes():
+        if volume.mountpoint == mountpoint:
+            return volume.device, volume.fstype
+    return mountpoint, ""
+
+
+def unescape_mount_field(value: str) -> str:
+    return (
+        value.replace("\\040", " ")
+        .replace("\\011", "\t")
+        .replace("\\012", "\n")
+        .replace("\\134", "\\")
+    )
+
+
+def find_mountpoint(path: str) -> str:
+    current = os.path.abspath(path)
+    if not os.path.isdir(current):
+        current = os.path.dirname(current)
+    current = current or os.path.abspath(os.sep)
+    try:
+        current_device = os.stat(current).st_dev
+    except OSError:
+        return current
+    while True:
+        parent = os.path.dirname(current)
+        if parent == current:
+            return current
+        try:
+            if os.stat(parent).st_dev != current_device:
+                return current
+        except OSError:
+            return current
+        current = parent
+
+
+def format_df_row(volume: StorageVolume, *, human: bool, show_type: bool, block_size: int) -> list[str]:
+    row = [volume.device]
+    if show_type:
+        row.append(volume.fstype or "-")
+    if human:
+        row.extend(
+            [
+                format_human_size(volume.total),
+                format_human_size(volume.used),
+                format_human_size(volume.free),
+                format_use_percent(volume.used, volume.total),
+                volume.mountpoint,
+            ]
+        )
+    else:
+        row.extend(
+            [
+                format_block_count(volume.total, block_size),
+                format_block_count(volume.used, block_size),
+                format_block_count(volume.free, block_size),
+                format_use_percent(volume.used, volume.total),
+                volume.mountpoint,
+            ]
+        )
+    return row
+
+
+def format_block_count(value: int, block_size: int) -> str:
+    return str((max(value, 0) + block_size - 1) // block_size)
+
+
+def format_use_percent(used: int, total: int) -> str:
+    if total <= 0:
+        return "-"
+    return f"{(max(used, 0) * 100 + total - 1) // total}%"
+
+
+def format_human_size(value: int) -> str:
+    units = ("B", "K", "M", "G", "T", "P", "E")
+    amount = float(max(value, 0))
+    unit = 0
+    while amount >= 1024 and unit + 1 < len(units):
+        amount /= 1024
+        unit += 1
+    if unit == 0:
+        return f"{int(amount)}B"
+    if amount >= 10 or amount.is_integer():
+        return f"{amount:.0f}{units[unit]}"
+    return f"{amount:.1f}{units[unit]}"
+
+
+def parse_size_argument(value: str) -> int | None:
+    match = re.fullmatch(r"(?i)(\d+)?([kmgtpe]?)(i?b?)?", value.strip())
+    if not match:
+        return None
+    number_text, suffix, _unit = match.groups()
+    number = int(number_text) if number_text else 1
+    multipliers = {
+        "": 1,
+        "k": 1024,
+        "m": 1024**2,
+        "g": 1024**3,
+        "t": 1024**4,
+        "p": 1024**5,
+        "e": 1024**6,
+    }
+    return number * multipliers[suffix.lower()]
+
+
+def parse_lsblk_columns(value: str) -> list[str]:
+    columns = []
+    for item in value.split(","):
+        column = item.strip().upper()
+        if column == "MOUNTPOINT":
+            column = "MOUNTPOINTS"
+        if column:
+            columns.append(column)
+    return columns
+
+
+def build_lsblk_rows(
+    volumes: list[StorageVolume],
+    columns: list[str],
+    *,
+    bytes_mode: bool,
+    no_deps: bool,
+    ascii_tree: bool,
+) -> list[list[str]]:
+    rows: list[list[str]] = []
+    branch = "`-" if ascii_tree else "\u2514\u2500"
+    for index, volume in enumerate(volumes):
+        disk_name = linux_disk_name(index)
+        disk_minor = index * 16
+        if no_deps:
+            rows.append(format_lsblk_row(columns, volume, disk_name, disk_name, disk_minor, "disk", bytes_mode, mountpoint=""))
+            continue
+        parent = StorageVolume(
+            device=volume.device,
+            mountpoint="",
+            fstype="",
+            label="",
+            total=volume.total,
+            used=volume.used,
+            free=volume.free,
+            drive_type=volume.drive_type,
+            removable=volume.removable,
+            readonly=volume.readonly,
+            serial="",
+        )
+        rows.append(format_lsblk_row(columns, parent, disk_name, disk_name, disk_minor, "disk", bytes_mode, mountpoint=""))
+        part_name = f"{disk_name}1"
+        rows.append(
+            format_lsblk_row(
+                columns,
+                volume,
+                branch + part_name,
+                part_name,
+                disk_minor + 1,
+                "part",
+                bytes_mode,
+                mountpoint=volume.mountpoint,
+            )
+        )
+    return rows
+
+
+def format_lsblk_row(
+    columns: list[str],
+    volume: StorageVolume,
+    name: str,
+    kname: str,
+    minor: int,
+    row_type: str,
+    bytes_mode: bool,
+    *,
+    mountpoint: str,
+) -> list[str]:
+    values = {
+        "NAME": name,
+        "KNAME": kname,
+        "MAJ:MIN": f"8:{minor}",
+        "RM": "1" if volume.removable else "0",
+        "SIZE": str(volume.total) if bytes_mode else format_human_size(volume.total),
+        "RO": "1" if volume.readonly else "0",
+        "TYPE": row_type,
+        "MOUNTPOINT": mountpoint,
+        "MOUNTPOINTS": mountpoint,
+        "FSTYPE": volume.fstype,
+        "LABEL": volume.label,
+        "UUID": volume.serial,
+        "FSAVAIL": str(volume.free) if bytes_mode else format_human_size(volume.free),
+        "FSUSE%": format_use_percent(volume.used, volume.total),
+        "MODEL": volume.drive_type,
+    }
+    return [values[column] for column in columns]
+
+
+def linux_disk_name(index: int) -> str:
+    letters = ""
+    value = index
+    while True:
+        letters = chr(ord("a") + (value % 26)) + letters
+        value = value // 26 - 1
+        if value < 0:
+            break
+    return "sd" + letters
+
+
+def write_aligned_table(
+    stdout: TextIO,
+    headers: list[str],
+    rows: list[list[str]],
+    *,
+    right_align: set[str] | None = None,
+) -> None:
+    if not rows and not headers:
+        return
+    right_align = right_align or set()
+    table = ([headers] if headers else []) + rows
+    columns = max(len(row) for row in table)
+    widths = [0] * columns
+    for row in table:
+        for index, cell in enumerate(row):
+            widths[index] = max(widths[index], len(cell))
+    right_indexes = {index for index, header in enumerate(headers) if header in right_align}
+    for row_number, row in enumerate(table):
+        parts = []
+        for index in range(columns):
+            cell = row[index] if index < len(row) else ""
+            if row_number > 0 and index in right_indexes:
+                parts.append(cell.rjust(widths[index]))
+            else:
+                parts.append(cell.ljust(widths[index]))
+        stdout.write(" ".join(parts).rstrip() + "\n")
+
+
 HELP_ITEMS: tuple[tuple[str, str, str], ...] = (
     ("!", "! PIPELINE", "Execute PIPELINE and invert its exit status."),
     ("pipeline", "COMMAND1 | COMMAND2", "Connect stdout of COMMAND1 to stdin of COMMAND2."),
@@ -2998,13 +4054,16 @@ HELP_ITEMS: tuple[tuple[str, str, str], ...] = (
     ("cp", "cp [-Rfp] source ... target", "Copy files and directories."),
     ("cut", "cut -b|-c|-f list [file ...]", "Select byte, character, or field ranges."),
     ("date", "date [+format]", "Display the current date and time."),
+    ("df", "df [-hkmPT] [file ...]", "Report filesystem disk space usage."),
     ("diff", "diff [-u] file1 file2", "Compare files line by line."),
     ("find", "find [path ...] [expression]", "Walk file trees and match paths."),
     ("grep", "grep [-EinvcqFlHh] pattern [file ...]", "Search files for matching lines."),
     ("install", "install [-D] [-d] [-m mode] source target", "Copy files and set attributes."),
     ("ls", "ls [-Aald1] [file ...]", "List directory contents."),
+    ("lsblk", "lsblk [-bdfin] [-o columns]", "List block devices and mounted filesystems."),
     ("mkdir", "mkdir [-p] dir ...", "Create directories."),
     ("mv", "mv source ... target", "Move or rename files."),
+    ("ps", "ps [aux|-ef]", "Display Windows process status using Linux-style output."),
     ("rm", "rm [-fRr] file ...", "Remove files or directories."),
     ("sed", "sed [-n] [-e script] [script] [file ...]", "Run a stream editing script."),
     ("sort", "sort [-fnru] [-o file] [file ...]", "Sort text lines."),
@@ -3054,6 +4113,7 @@ INTERNAL_UTILITIES: dict[str, Utility] = {
     "cp": utility_cp,
     "cut": utility_cut,
     "date": utility_date,
+    "df": utility_df,
     "diff": utility_diff,
     "diff3": utility_diff3,
     "dirname": utility_dirname,
@@ -3071,6 +4131,7 @@ INTERNAL_UTILITIES: dict[str, Utility] = {
     "ln": utility_ln,
     "locate": utility_locate,
     "ls": utility_ls,
+    "lsblk": utility_lsblk,
     "mkdir": utility_mkdir,
     "mv": utility_mv,
     "ps": utility_ps,
