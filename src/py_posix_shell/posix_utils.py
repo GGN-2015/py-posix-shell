@@ -203,122 +203,329 @@ def utility_vi(shell, argv: list[str], stdin: TextIO, stdout: TextIO, stderr: Te
 
     paths = [arg for arg in argv[1:] if arg != "--" and not arg.startswith("-")]
     file_path = Path(paths[0]) if paths else None
-    lines: list[str] = []
-    if file_path is not None and file_path.exists():
+    if not stream_is_tty(stdin) or not stream_is_tty(stdout):
+        stderr.write("vi: fallback editor requires a TTY; install vi or vim for non-interactive use\n")
+        return 2
+
+    editor = WindowsViEditor(file_path, stdout, stderr)
+    try:
+        return editor.run()
+    except KeyboardInterrupt:
+        return 130
+
+
+class WindowsViEditor:
+    def __init__(self, file_path: Path | None, stdout: TextIO, stderr: TextIO) -> None:
+        self.file_path = file_path
+        self.stdout = stdout
+        self.stderr = stderr
+        self.lines = [""]
+        self.cursor_line = 0
+        self.cursor_col = 0
+        self.top_line = 0
+        self.mode = "NORMAL"
+        self.command = ""
+        self.status = "py-posix-shell vi fallback"
+        self.dirty = False
+        self.exit_status: int | None = None
+        self.pending = ""
+        self.load()
+
+    def load(self) -> None:
+        if self.file_path is None or not self.file_path.exists():
+            self.lines = [""]
+            return
         try:
-            lines = file_path.read_text(encoding="utf-8", errors="replace").splitlines()
+            text = self.file_path.read_text(encoding="utf-8", errors="replace")
         except OSError as exc:
-            stderr.write(f"vi: {file_path}: {exc.strerror or exc}\n")
-            return 1
+            self.status = f"{self.file_path}: {exc.strerror or exc}"
+            self.lines = [""]
+            return
+        self.lines = text.splitlines() or [""]
+        self.status = f'"{self.file_path}" {len(self.lines)} lines'
 
-    current = 0 if lines else -1
-    dirty = False
-    stdout.write("py-posix-shell vi fallback (line mode). Type h for help.\n")
+    def run(self) -> int:
+        import msvcrt
 
-    def write_file() -> bool:
-        if file_path is None:
-            stdout.write("No file name\n")
+        self.enter_screen()
+        try:
+            while self.exit_status is None:
+                self.render()
+                key = self.read_key(msvcrt)
+                self.handle_key(key)
+        finally:
+            self.leave_screen()
+        return self.exit_status
+
+    def enter_screen(self) -> None:
+        self.enable_virtual_terminal()
+        self.stdout.write("\033[?1049h\033[?25l\033[2J\033[H")
+        self.stdout.flush()
+
+    def leave_screen(self) -> None:
+        self.stdout.write("\033[?25h\033[?1049l")
+        self.stdout.flush()
+
+    def enable_virtual_terminal(self) -> None:
+        if os.name != "nt":
+            return
+        try:
+            import ctypes
+        except ImportError:
+            return
+
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.GetStdHandle(-11)
+        if handle in {-1, 0}:
+            return
+        mode = ctypes.c_uint32()
+        if not kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+            return
+        kernel32.SetConsoleMode(handle, mode.value | 0x0004)
+
+    def read_key(self, msvcrt_module) -> str:
+        char = msvcrt_module.getwch()
+        if char in {"\x00", "\xe0"}:
+            code = msvcrt_module.getwch()
+            return {
+                "H": "UP",
+                "P": "DOWN",
+                "K": "LEFT",
+                "M": "RIGHT",
+                "G": "HOME",
+                "O": "END",
+                "S": "DELETE",
+            }.get(code, "")
+        if char == "\x03":
+            raise KeyboardInterrupt
+        if char == "\x1b":
+            return "ESC"
+        if char in {"\r", "\n"}:
+            return "ENTER"
+        if char in {"\b", "\x7f"}:
+            return "BACKSPACE"
+        return char
+
+    def render(self) -> None:
+        columns, rows = shutil.get_terminal_size((80, 24))
+        text_rows = max(1, rows - 2)
+        self.keep_cursor_visible(text_rows)
+        self.stdout.write("\033[H")
+        for screen_row in range(text_rows):
+            line_index = self.top_line + screen_row
+            if line_index < len(self.lines):
+                text = self.display_line(self.lines[line_index])[:columns]
+            else:
+                text = "~"
+            self.stdout.write("\033[K" + text + "\n")
+        name = str(self.file_path) if self.file_path is not None else "[No Name]"
+        modified = " [+]" if self.dirty else ""
+        status = f" {self.mode}  {name}{modified}  Ln {self.cursor_line + 1}, Col {self.cursor_col + 1} "
+        self.stdout.write("\033[7m" + status[:columns].ljust(columns) + "\033[0m\n")
+        command_line = ":" + self.command if self.mode == "COMMAND" else self.status
+        self.stdout.write("\033[K" + command_line[:columns])
+        screen_y = self.cursor_line - self.top_line + 1
+        screen_x = min(self.cursor_col + 1, columns)
+        if self.mode == "COMMAND":
+            screen_y = rows
+            screen_x = min(len(self.command) + 2, columns)
+        self.stdout.write(f"\033[{screen_y};{screen_x}H")
+        self.stdout.flush()
+
+    def display_line(self, line: str) -> str:
+        return "".join(char if char >= " " else " " for char in line.expandtabs(4))
+
+    def keep_cursor_visible(self, text_rows: int) -> None:
+        if self.cursor_line < self.top_line:
+            self.top_line = self.cursor_line
+        elif self.cursor_line >= self.top_line + text_rows:
+            self.top_line = self.cursor_line - text_rows + 1
+
+    def handle_key(self, key: str) -> None:
+        if self.mode == "INSERT":
+            self.handle_insert_key(key)
+        elif self.mode == "COMMAND":
+            self.handle_command_key(key)
+        else:
+            self.handle_normal_key(key)
+
+    def handle_normal_key(self, key: str) -> None:
+        if key in {"h", "LEFT"}:
+            self.move_left()
+        elif key in {"j", "DOWN"}:
+            self.move_down()
+        elif key in {"k", "UP"}:
+            self.move_up()
+        elif key in {"l", "RIGHT"}:
+            self.move_right()
+        elif key == "HOME" or key == "0":
+            self.cursor_col = 0
+        elif key == "END" or key == "$":
+            self.cursor_col = len(self.current_line())
+        elif key == "i":
+            self.mode = "INSERT"
+            self.status = "-- INSERT --"
+        elif key == "a":
+            self.move_right(allow_end=True)
+            self.mode = "INSERT"
+            self.status = "-- INSERT --"
+        elif key == "o":
+            self.cursor_line += 1
+            self.lines.insert(self.cursor_line, "")
+            self.cursor_col = 0
+            self.mode = "INSERT"
+            self.dirty = True
+        elif key == "O":
+            self.lines.insert(self.cursor_line, "")
+            self.cursor_col = 0
+            self.mode = "INSERT"
+            self.dirty = True
+        elif key == "x" or key == "DELETE":
+            self.delete_char()
+        elif key == "d":
+            if self.pending == "d":
+                self.delete_line()
+                self.pending = ""
+            else:
+                self.pending = "d"
+                return
+        elif key == ":":
+            self.mode = "COMMAND"
+            self.command = ""
+        elif key == "ESC":
+            self.pending = ""
+        self.pending = "" if key != "d" else self.pending
+
+    def handle_insert_key(self, key: str) -> None:
+        if key == "ESC":
+            self.mode = "NORMAL"
+            self.status = ""
+            if self.cursor_col > 0:
+                self.cursor_col -= 1
+        elif key == "ENTER":
+            line = self.current_line()
+            before, after = line[: self.cursor_col], line[self.cursor_col :]
+            self.lines[self.cursor_line] = before
+            self.lines.insert(self.cursor_line + 1, after)
+            self.cursor_line += 1
+            self.cursor_col = 0
+            self.dirty = True
+        elif key == "BACKSPACE":
+            self.backspace()
+        elif key == "LEFT":
+            self.move_left()
+        elif key == "RIGHT":
+            self.move_right(allow_end=True)
+        elif key == "UP":
+            self.move_up()
+        elif key == "DOWN":
+            self.move_down()
+        elif len(key) == 1 and key >= " ":
+            line = self.current_line()
+            self.lines[self.cursor_line] = line[: self.cursor_col] + key + line[self.cursor_col :]
+            self.cursor_col += 1
+            self.dirty = True
+
+    def handle_command_key(self, key: str) -> None:
+        if key == "ESC":
+            self.mode = "NORMAL"
+            self.command = ""
+        elif key == "BACKSPACE":
+            self.command = self.command[:-1]
+        elif key == "ENTER":
+            self.execute_command(self.command.strip())
+            self.command = ""
+            if self.exit_status is None:
+                self.mode = "NORMAL"
+        elif len(key) == 1 and key >= " ":
+            self.command += key
+
+    def execute_command(self, command: str) -> None:
+        if command in {"q", "quit"}:
+            if self.dirty:
+                self.status = "No write since last change (add ! to override)"
+            else:
+                self.exit_status = 0
+        elif command in {"q!", "quit!"}:
+            self.exit_status = 0
+        elif command in {"w", "write"} or command.startswith("w "):
+            target = command.split(maxsplit=1)[1] if " " in command else ""
+            self.write_file(Path(target) if target else self.file_path)
+        elif command in {"wq", "x"}:
+            if self.write_file(self.file_path):
+                self.exit_status = 0
+        elif command.startswith("wq "):
+            if self.write_file(Path(command.split(maxsplit=1)[1])):
+                self.exit_status = 0
+        else:
+            self.status = f"Not an editor command: {command}"
+
+    def write_file(self, path: Path | None) -> bool:
+        if path is None:
+            self.status = "No file name"
             return False
         try:
-            file_path.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+            path.write_text("\n".join(self.lines) + "\n", encoding="utf-8")
         except OSError as exc:
-            stderr.write(f"vi: {file_path}: {exc.strerror or exc}\n")
+            self.status = f"{path}: {exc.strerror or exc}"
             return False
-        stdout.write(f"\"{file_path}\" {len(lines)} lines written\n")
+        self.file_path = path
+        self.dirty = False
+        self.status = f'"{path}" {len(self.lines)} lines written'
         return True
 
-    def print_buffer(numbered: bool = True) -> None:
-        for line_number, line in enumerate(lines, 1):
-            stdout.write(f"{line_number:6d}\t{line}\n" if numbered else line + "\n")
+    def current_line(self) -> str:
+        return self.lines[self.cursor_line]
 
-    while True:
-        stdout.write(":")
-        try:
-            stdout.flush()
-        except OSError:
-            pass
-        command = stdin.readline()
-        if command == "":
-            return 1 if dirty else 0
-        command = command.rstrip("\r\n")
-        if command in {"h", "help"}:
-            stdout.write("Commands: i, a, ., p, %p, number, $, d, /text, s/old/new/, w, q, q!, wq\n")
-        elif command in {"i", "a"}:
-            insert_at = current if command == "i" and current >= 0 else current + 1
-            if insert_at < 0:
-                insert_at = 0
-            inserted: list[str] = []
-            while True:
-                line = stdin.readline()
-                if line == "":
-                    break
-                line = line.rstrip("\r\n")
-                if line == ".":
-                    break
-                inserted.append(line)
-            lines[insert_at:insert_at] = inserted
-            if inserted:
-                current = insert_at + len(inserted) - 1
-                dirty = True
-        elif command in {"p", "%p"}:
-            print_buffer(numbered=True)
-        elif command == "$":
-            if lines:
-                current = len(lines) - 1
-                stdout.write(lines[current] + "\n")
-        elif command.isdigit():
-            line_number = int(command)
-            if 1 <= line_number <= len(lines):
-                current = line_number - 1
-                stdout.write(lines[current] + "\n")
-            else:
-                stdout.write("Invalid line number\n")
-        elif command == "d":
-            if 0 <= current < len(lines):
-                del lines[current]
-                if current >= len(lines):
-                    current = len(lines) - 1
-                dirty = True
-            else:
-                stdout.write("No current line\n")
-        elif command.startswith("/"):
-            needle = command[1:]
-            found = next((index for index, line in enumerate(lines) if needle in line), None)
-            if found is None:
-                stdout.write("Pattern not found\n")
-            else:
-                current = found
-                stdout.write(lines[current] + "\n")
-        elif command.startswith("s/"):
-            parts = command.split("/")
-            if len(parts) < 4:
-                stdout.write("Bad substitute command\n")
-            elif 0 <= current < len(lines):
-                old, new = parts[1], parts[2]
-                replaced = lines[current].replace(old, new, 1)
-                dirty = dirty or replaced != lines[current]
-                lines[current] = replaced
-                stdout.write(lines[current] + "\n")
-            else:
-                stdout.write("No current line\n")
-        elif command in {"w", "write"}:
-            dirty = not write_file()
-        elif command in {"wq", "x"}:
-            if write_file():
-                return 0
-            return 1
-        elif command == "q":
-            if dirty:
-                stdout.write("No write since last change; use q! to quit\n")
-            else:
-                return 0
-        elif command == "q!":
-            return 0
-        elif command == "":
-            if 0 <= current < len(lines):
-                stdout.write(lines[current] + "\n")
+    def move_left(self) -> None:
+        if self.cursor_col > 0:
+            self.cursor_col -= 1
+
+    def move_right(self, *, allow_end: bool = False) -> None:
+        limit = len(self.current_line()) if allow_end else max(0, len(self.current_line()) - 1)
+        if self.cursor_col < limit:
+            self.cursor_col += 1
+
+    def move_up(self) -> None:
+        if self.cursor_line > 0:
+            self.cursor_line -= 1
+            self.cursor_col = min(self.cursor_col, len(self.current_line()))
+
+    def move_down(self) -> None:
+        if self.cursor_line + 1 < len(self.lines):
+            self.cursor_line += 1
+            self.cursor_col = min(self.cursor_col, len(self.current_line()))
+
+    def delete_char(self) -> None:
+        line = self.current_line()
+        if self.cursor_col < len(line):
+            self.lines[self.cursor_line] = line[: self.cursor_col] + line[self.cursor_col + 1 :]
+            self.dirty = True
+
+    def delete_line(self) -> None:
+        if len(self.lines) == 1:
+            self.lines[0] = ""
+            self.cursor_col = 0
         else:
-            stdout.write(f"Unknown command: {command}\n")
+            del self.lines[self.cursor_line]
+            if self.cursor_line >= len(self.lines):
+                self.cursor_line = len(self.lines) - 1
+            self.cursor_col = min(self.cursor_col, len(self.current_line()))
+        self.dirty = True
+
+    def backspace(self) -> None:
+        if self.cursor_col > 0:
+            line = self.current_line()
+            self.lines[self.cursor_line] = line[: self.cursor_col - 1] + line[self.cursor_col :]
+            self.cursor_col -= 1
+            self.dirty = True
+        elif self.cursor_line > 0:
+            previous_len = len(self.lines[self.cursor_line - 1])
+            self.lines[self.cursor_line - 1] += self.lines[self.cursor_line]
+            del self.lines[self.cursor_line]
+            self.cursor_line -= 1
+            self.cursor_col = previous_len
+            self.dirty = True
 
 
 def utility_ls(shell, argv: list[str], stdin: TextIO, stdout: TextIO, stderr: TextIO) -> int:
@@ -1912,6 +2119,16 @@ def write_binary_output(stdout: TextIO, data: bytes) -> None:
         stdout.write(data.decode("latin-1"))
 
 
+def stream_is_tty(stream: TextIO) -> bool:
+    isatty = getattr(stream, "isatty", None)
+    if isatty is None:
+        return False
+    try:
+        return bool(isatty())
+    except OSError:
+        return False
+
+
 def expand_tr_set(spec: str) -> str:
     result: list[str] = []
     index = 0
@@ -2793,7 +3010,7 @@ HELP_ITEMS: tuple[tuple[str, str, str], ...] = (
     ("sort", "sort [-fnru] [-o file] [file ...]", "Sort text lines."),
     ("tar", "tar -cf|-xf|-tf archive [file ...]", "Create, extract, or list tar archives."),
     ("tr", "tr [-d] set1 [set2]", "Translate or delete characters."),
-    ("vi", "vi [file]", "Edit a file with the Windows-only fallback line editor when vi/vim is missing."),
+    ("vi", "vi [file]", "Edit a file with the Windows-only full-screen TTY fallback when vi/vim is missing."),
     ("wc", "wc [-lwc] [file ...]", "Count lines, words, and bytes."),
     ("xargs", "xargs [-0] [-n count] [-I repl] [command ...]", "Build command lines from standard input."),
 )

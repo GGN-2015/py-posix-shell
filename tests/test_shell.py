@@ -8,6 +8,7 @@ import sys
 import py_posix_shell.shell as shell_module
 from py_posix_shell.lexer import dump_tokens, lex
 from py_posix_shell.errors import ShellExit
+from py_posix_shell.posix_utils import WindowsViEditor
 from py_posix_shell.shell import Shell
 
 
@@ -661,11 +662,37 @@ def test_windows_vi_fallback_without_path(tmp_path):
     target = tmp_path / "note.txt"
     script = f'printf "i\\nhello\\nworld\\n.\\nwq\\n" | vi "{target}"'
     status, stdout, stderr, _shell = run_shell(script, env={"PATH": ""})
-    assert status == 0
+    assert status == 2
+    assert stdout == ""
+    assert "fallback editor requires a TTY" in stderr
+    assert not target.exists()
+
+
+def test_windows_vi_editor_core_writes_file(tmp_path):
+    target = tmp_path / "note.txt"
+    editor = WindowsViEditor(target, io.StringIO(), io.StringIO())
+    editor.handle_normal_key("i")
+    for char in "hello":
+        editor.handle_insert_key(char)
+    editor.handle_insert_key("ENTER")
+    for char in "world":
+        editor.handle_insert_key(char)
+    editor.handle_insert_key("ESC")
+    editor.execute_command("wq")
+    assert editor.exit_status == 0
     assert target.read_text(encoding="utf-8") == "hello\nworld\n"
-    assert "py-posix-shell vi fallback" in stdout
-    assert "2 lines written" in stdout
-    assert stderr == ""
+
+
+def test_windows_vi_editor_insert_mode_arrows(tmp_path):
+    target = tmp_path / "note.txt"
+    editor = WindowsViEditor(target, io.StringIO(), io.StringIO())
+    editor.handle_normal_key("i")
+    for char in "abc":
+        editor.handle_insert_key(char)
+    editor.handle_insert_key("LEFT")
+    editor.handle_insert_key("X")
+    editor.execute_command("wq")
+    assert target.read_text(encoding="utf-8") == "abXc\n"
 
 
 def test_windows_vi_prefers_available_vim(monkeypatch):
