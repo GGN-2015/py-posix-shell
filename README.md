@@ -23,6 +23,7 @@ scripts:
 - field splitting, pathname expansion, tilde expansion, and `set -f`
 - here-documents with `<<` and `<<-`
 - redirection with `<`, `>`, `>>`, `<>`, `2>`, `2>>`, `>&`, and `<&`
+- interactive filename completion with `Tab`
 - shell variables, exported environment variables, and positional parameters
 - common builtins including `.`, `:`, `alias`, `unalias`, `cd`, `pwd`, `eval`,
   `exec`, `exit`, `export`, `readonly`, `unset`, `set`, `shift`, `getopts`,

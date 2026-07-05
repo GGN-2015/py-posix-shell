@@ -450,6 +450,44 @@ def test_history_builtin_tracks_repl_commands(monkeypatch):
     assert stderr.getvalue() == ""
 
 
+def test_tab_completion_completes_single_file_and_common_prefix(tmp_path):
+    old_cwd = os.getcwd()
+    os.chdir(tmp_path)
+    try:
+        (tmp_path / "alpha.txt").write_text("", encoding="utf-8")
+        shell = Shell(stdout=io.StringIO(), stderr=io.StringIO())
+        assert shell.complete_line_for_tab("cat al").line == "cat alpha.txt"
+
+        (tmp_path / "alpine.txt").write_text("", encoding="utf-8")
+        result = shell.complete_line_for_tab("cat al")
+        assert result.line == "cat alp"
+        assert result.beep is False
+        assert result.listings == ()
+    finally:
+        os.chdir(old_cwd)
+
+
+def test_tab_completion_lists_matches_when_prefix_is_already_lcp(tmp_path):
+    old_cwd = os.getcwd()
+    os.chdir(tmp_path)
+    try:
+        for index in range(12):
+            (tmp_path / f"ap{index:02d}.txt").write_text("", encoding="utf-8")
+        stdout = io.StringIO()
+        shell = Shell(stdout=stdout, stderr=io.StringIO())
+        result = shell.complete_line_for_tab("echo ap")
+        assert result.line == "echo ap"
+        assert result.beep is True
+        assert result.listings == tuple(f"ap{index:02d}.txt" for index in range(10))
+        assert result.hidden_count == 2
+        shell.render_completion_result(result, "$ ", "echo ap")
+        rendered = stdout.getvalue()
+        assert rendered.startswith("\a\nap00.txt\n")
+        assert "... 2 terms hidden ...\n$ echo ap" in rendered
+    finally:
+        os.chdir(old_cwd)
+
+
 def test_py_web_ssh_cwd_prompt_injection_without_native_utilities(monkeypatch, tmp_path):
     token = "testtoken"
     stdout = io.StringIO()

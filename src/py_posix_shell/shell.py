@@ -12,7 +12,8 @@ import shutil
 import subprocess
 import sys
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Iterator, TextIO
 
 from .builtins import BUILTINS, SPECIAL_BUILTINS
@@ -50,6 +51,14 @@ class ExpandedCommand:
 class HereDoc:
     body: str
     expand: bool
+
+
+@dataclass(frozen=True)
+class CompletionResult:
+    line: str
+    beep: bool = False
+    listings: tuple[str, ...] = field(default_factory=tuple)
+    hidden_count: int = 0
 
 
 class Shell:
@@ -856,7 +865,7 @@ class Shell:
                 status = 2
                 self.last_status = status
             try:
-                line = input(prompt)
+                line = self.read_input_line(prompt)
             except EOFError:
                 self.stdout.write("\n")
                 return status
@@ -900,6 +909,140 @@ class Shell:
                 status = 130
                 self.last_status = status
             buffer = ""
+
+    def read_input_line(self, prompt: str) -> str:
+        if self.stdin is sys.stdin and self.stdout is sys.stdout and sys.stdin.isatty():
+            return self.read_console_line(prompt)
+        return self.process_tabs_in_input(input(prompt), prompt)
+
+    def process_tabs_in_input(self, line: str, prompt: str) -> str:
+        if "\t" not in line:
+            return line
+        buffer = ""
+        for char in line:
+            if char == "\t":
+                result = self.complete_line_for_tab(buffer)
+                old_buffer = buffer
+                buffer = result.line
+                self.render_completion_result(result, prompt, old_buffer)
+            else:
+                buffer += char
+        return buffer
+
+    def read_console_line(self, prompt: str) -> str:
+        self.stdout.write(prompt)
+        self.stdout.flush()
+        if os.name == "nt":
+            return self.read_windows_console_line(prompt)
+        return self.read_posix_console_line(prompt)
+
+    def read_windows_console_line(self, prompt: str) -> str:
+        import msvcrt
+
+        line = ""
+        while True:
+            char = msvcrt.getwch()
+            if char in {"\x00", "\xe0"}:
+                msvcrt.getwch()
+                continue
+            if char == "\x03":
+                raise KeyboardInterrupt
+            if char == "\x04":
+                raise EOFError
+            if char in {"\r", "\n"}:
+                self.stdout.write("\n")
+                return line
+            if char == "\t":
+                result = self.complete_line_for_tab(line)
+                self.render_completion_result(result, prompt, line)
+                line = result.line
+                continue
+            if char in {"\b", "\x7f"}:
+                if line:
+                    line = line[:-1]
+                    self.stdout.write("\b \b")
+                    self.stdout.flush()
+                continue
+            if char >= " ":
+                line += char
+                self.stdout.write(char)
+                self.stdout.flush()
+
+    def read_posix_console_line(self, prompt: str) -> str:
+        import termios
+        import tty
+
+        fd = sys.stdin.fileno()
+        old_attrs = termios.tcgetattr(fd)
+        line = ""
+        try:
+            tty.setraw(fd)
+            while True:
+                char = sys.stdin.read(1)
+                if char == "\x03":
+                    raise KeyboardInterrupt
+                if char == "\x04":
+                    raise EOFError
+                if char in {"\r", "\n"}:
+                    self.stdout.write("\n")
+                    return line
+                if char == "\t":
+                    result = self.complete_line_for_tab(line)
+                    self.render_completion_result(result, prompt, line)
+                    line = result.line
+                    continue
+                if char in {"\b", "\x7f"}:
+                    if line:
+                        line = line[:-1]
+                        self.stdout.write("\b \b")
+                        self.stdout.flush()
+                    continue
+                if char == "\x1b":
+                    # Drop simple escape sequences such as arrow keys.
+                    sys.stdin.read(1)
+                    sys.stdin.read(1)
+                    continue
+                if char >= " ":
+                    line += char
+                    self.stdout.write(char)
+                    self.stdout.flush()
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old_attrs)
+
+    def complete_line_for_tab(self, line: str) -> CompletionResult:
+        if not line or line[-1].isspace():
+            return CompletionResult(line=line, beep=True)
+        start = len(line)
+        while start > 0 and not line[start - 1].isspace():
+            start -= 1
+        prefix = line[start:]
+        try:
+            matches = sorted(entry.name for entry in Path(".").iterdir() if entry.name.startswith(prefix))
+        except OSError:
+            return CompletionResult(line=line, beep=True)
+        if not matches:
+            return CompletionResult(line=line, beep=True)
+        if len(matches) == 1:
+            return CompletionResult(line=line[:start] + matches[0])
+        common = os.path.commonprefix(matches)
+        if len(common) > len(prefix):
+            return CompletionResult(line=line[:start] + common)
+        shown = tuple(matches[:10])
+        return CompletionResult(line=line, beep=True, listings=shown, hidden_count=len(matches) - len(shown))
+
+    def render_completion_result(self, result: CompletionResult, prompt: str, previous_line: str) -> None:
+        if result.beep:
+            self.stdout.write("\a")
+        if result.listings:
+            self.stdout.write("\n")
+            for item in result.listings:
+                self.stdout.write(item + "\n")
+            if result.hidden_count > 0:
+                self.stdout.write(f"... {result.hidden_count} terms hidden ...\n")
+            self.stdout.write(prompt + result.line)
+        elif result.line.startswith(previous_line) and len(result.line) > len(previous_line):
+            self.stdout.write(result.line[len(previous_line) :])
+        self.stdout.flush()
 
     def expand_prompt(self, prompt: str) -> str:
         return chars_to_text(expand_text(self, prompt, quoted=True))
