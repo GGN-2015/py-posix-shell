@@ -620,7 +620,7 @@ def builtin_type(shell, argv: list[str], stdin: TextIO, stdout: TextIO, stderr: 
         if shell.is_builtin(name):
             stdout.write(f"{name} is a shell builtin\n")
             continue
-        if shell.is_internal_utility(name) and shell.resolve_command(name, shell.env) is None:
+        if shell.should_run_internal_utility(name, shell.env):
             stdout.write(f"{name} is a shell utility\n")
             continue
         path = shell.which(name)
@@ -642,7 +642,7 @@ def builtin_command(shell, argv: list[str], stdin: TextIO, stdout: TextIO, stder
             if shell.is_builtin(name):
                 stdout.write(f"{name}\n" if args[0] == "-v" else f"{name} is a shell builtin\n")
                 continue
-            if shell.is_internal_utility(name) and shell.resolve_command(name, shell.env) is None:
+            if shell.should_run_internal_utility(name, shell.env):
                 stdout.write(f"{name}\n" if args[0] == "-v" else f"{name} is a shell utility\n")
                 continue
             path = shell.which(name)

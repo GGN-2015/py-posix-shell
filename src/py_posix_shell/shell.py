@@ -1168,6 +1168,8 @@ class Shell:
         return name in INTERNAL_UTILITIES
 
     def which(self, name: str) -> str | None:
+        if self.should_run_internal_utility(name, self.env):
+            return name
         path = self.resolve_command(name, self.env)
         if path:
             return path
@@ -1190,6 +1192,8 @@ class Shell:
     def should_run_internal_utility(self, name: str, env: dict[str, str]) -> bool:
         if name not in INTERNAL_UTILITIES:
             return False
+        if name == "help":
+            return True
         if name == "vi" and os.name != "nt":
             return False
         return self.resolve_command(name, env) is None

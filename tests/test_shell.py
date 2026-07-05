@@ -702,6 +702,27 @@ def test_internal_help_utility_without_path():
     assert "help: no help topics match 'nope'\n" == stderr
 
 
+def test_help_prefers_internal_utility_even_when_external_exists(monkeypatch):
+    shell = Shell(stdout=io.StringIO(), stderr=io.StringIO(), env={"PATH": "C:\\fake"})
+
+    def fake_resolve(name, _env):
+        if name == "help":
+            return "C:\\Windows\\System32\\help.exe"
+        return None
+
+    monkeypatch.setattr(shell, "resolve_command", fake_resolve)
+
+    status = shell.execute("help cd; command -v help; command -V help; type help")
+    stdout = shell.stdout.getvalue()
+
+    assert status == 0
+    assert "cd [dir]\n    Change the current directory." in stdout
+    assert "\nhelp\n" in stdout
+    assert "help is a shell utility\n" in stdout
+    assert "C:\\Windows\\System32\\help.exe" not in stdout
+    assert shell.stderr.getvalue() == ""
+
+
 def test_windows_vi_fallback_without_path(tmp_path):
     if os.name != "nt":
         return
