@@ -4947,6 +4947,8 @@ def find_executable_matches(name: str, env: dict[str, str]) -> list[str]:
     matches: list[str] = []
     path_text = env.get("PATH", os.environ.get("PATH", ""))
     for directory in split_path_list(path_text):
+        if directory == "" and os.name == "nt":
+            continue
         search_dir = normalize_path_entry(directory or ".")
         for candidate in executable_name_candidates(name, env):
             path = os.path.join(search_dir, candidate)

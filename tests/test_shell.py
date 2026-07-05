@@ -784,8 +784,34 @@ echo status:$?
         os.chdir(old_cwd)
 
     assert status == 0
-    assert stdout == "bat:backslash\nstatus:7\nbat:slash\nstatus:7\nbat:bare\nstatus:7\n"
-    assert stderr == ""
+    assert stdout == "bat:backslash\nstatus:7\nbat:slash\nstatus:7\nstatus:127\n"
+    assert stderr == "runme.bat: command not found\n"
+
+
+def test_windows_bare_executable_searches_path_not_current_directory(tmp_path):
+    if os.name != "nt":
+        return
+
+    local_tool = tmp_path / "local.exe"
+    local_tool.write_text("", encoding="utf-8")
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    path_tool = bin_dir / "path-tool.exe"
+    path_tool.write_text("", encoding="utf-8")
+
+    old_cwd = os.getcwd()
+    try:
+        os.chdir(tmp_path)
+        local_shell = Shell(env={"PATH": "", "PATHEXT": ".EXE;.BAT;.CMD"})
+        path_shell = Shell(env={"PATH": str(bin_dir), "PATHEXT": ".EXE;.BAT;.CMD"})
+
+        assert local_shell.resolve_command("local.exe", local_shell.env) is None
+        assert os.path.normcase(local_shell.resolve_command("./local.exe", local_shell.env) or "") == os.path.normcase(str(local_tool))
+        assert os.path.normcase(local_shell.resolve_command(r".\local.exe", local_shell.env) or "") == os.path.normcase(str(local_tool))
+        assert os.path.normcase(path_shell.resolve_command("path-tool.exe", path_shell.env) or "") == os.path.normcase(str(path_tool))
+        assert os.path.normcase(path_shell.resolve_command("path-tool", path_shell.env) or "") == os.path.normcase(str(path_tool))
+    finally:
+        os.chdir(old_cwd)
 
 
 def test_external_keyboard_interrupt_returns_130(monkeypatch):

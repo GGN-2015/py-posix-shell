@@ -1251,10 +1251,6 @@ class Shell:
         matches = find_executable_matches(name, env)
         if matches:
             return matches[0]
-        if os.name == "nt":
-            for candidate in executable_path_candidates(os.path.join(".", name), env):
-                if is_executable_file(candidate):
-                    return os.path.abspath(candidate)
         if os.name == "nt" and name == "vi":
             vim_matches = find_executable_matches("vim", env)
             if vim_matches:
