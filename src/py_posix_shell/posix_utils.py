@@ -196,6 +196,131 @@ def utility_help(shell, argv: list[str], stdin: TextIO, stdout: TextIO, stderr: 
     return status
 
 
+def utility_vi(shell, argv: list[str], stdin: TextIO, stdout: TextIO, stderr: TextIO) -> int:
+    if os.name != "nt":
+        stderr.write("vi: fallback editor is only available on Windows when vi/vim is missing\n")
+        return 127
+
+    paths = [arg for arg in argv[1:] if arg != "--" and not arg.startswith("-")]
+    file_path = Path(paths[0]) if paths else None
+    lines: list[str] = []
+    if file_path is not None and file_path.exists():
+        try:
+            lines = file_path.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError as exc:
+            stderr.write(f"vi: {file_path}: {exc.strerror or exc}\n")
+            return 1
+
+    current = 0 if lines else -1
+    dirty = False
+    stdout.write("py-posix-shell vi fallback (line mode). Type h for help.\n")
+
+    def write_file() -> bool:
+        if file_path is None:
+            stdout.write("No file name\n")
+            return False
+        try:
+            file_path.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+        except OSError as exc:
+            stderr.write(f"vi: {file_path}: {exc.strerror or exc}\n")
+            return False
+        stdout.write(f"\"{file_path}\" {len(lines)} lines written\n")
+        return True
+
+    def print_buffer(numbered: bool = True) -> None:
+        for line_number, line in enumerate(lines, 1):
+            stdout.write(f"{line_number:6d}\t{line}\n" if numbered else line + "\n")
+
+    while True:
+        stdout.write(":")
+        try:
+            stdout.flush()
+        except OSError:
+            pass
+        command = stdin.readline()
+        if command == "":
+            return 1 if dirty else 0
+        command = command.rstrip("\r\n")
+        if command in {"h", "help"}:
+            stdout.write("Commands: i, a, ., p, %p, number, $, d, /text, s/old/new/, w, q, q!, wq\n")
+        elif command in {"i", "a"}:
+            insert_at = current if command == "i" and current >= 0 else current + 1
+            if insert_at < 0:
+                insert_at = 0
+            inserted: list[str] = []
+            while True:
+                line = stdin.readline()
+                if line == "":
+                    break
+                line = line.rstrip("\r\n")
+                if line == ".":
+                    break
+                inserted.append(line)
+            lines[insert_at:insert_at] = inserted
+            if inserted:
+                current = insert_at + len(inserted) - 1
+                dirty = True
+        elif command in {"p", "%p"}:
+            print_buffer(numbered=True)
+        elif command == "$":
+            if lines:
+                current = len(lines) - 1
+                stdout.write(lines[current] + "\n")
+        elif command.isdigit():
+            line_number = int(command)
+            if 1 <= line_number <= len(lines):
+                current = line_number - 1
+                stdout.write(lines[current] + "\n")
+            else:
+                stdout.write("Invalid line number\n")
+        elif command == "d":
+            if 0 <= current < len(lines):
+                del lines[current]
+                if current >= len(lines):
+                    current = len(lines) - 1
+                dirty = True
+            else:
+                stdout.write("No current line\n")
+        elif command.startswith("/"):
+            needle = command[1:]
+            found = next((index for index, line in enumerate(lines) if needle in line), None)
+            if found is None:
+                stdout.write("Pattern not found\n")
+            else:
+                current = found
+                stdout.write(lines[current] + "\n")
+        elif command.startswith("s/"):
+            parts = command.split("/")
+            if len(parts) < 4:
+                stdout.write("Bad substitute command\n")
+            elif 0 <= current < len(lines):
+                old, new = parts[1], parts[2]
+                replaced = lines[current].replace(old, new, 1)
+                dirty = dirty or replaced != lines[current]
+                lines[current] = replaced
+                stdout.write(lines[current] + "\n")
+            else:
+                stdout.write("No current line\n")
+        elif command in {"w", "write"}:
+            dirty = not write_file()
+        elif command in {"wq", "x"}:
+            if write_file():
+                return 0
+            return 1
+        elif command == "q":
+            if dirty:
+                stdout.write("No write since last change; use q! to quit\n")
+            else:
+                return 0
+        elif command == "q!":
+            return 0
+        elif command == "":
+            if 0 <= current < len(lines):
+                stdout.write(lines[current] + "\n")
+        else:
+            stdout.write(f"Unknown command: {command}\n")
+
+
 def utility_ls(shell, argv: list[str], stdin: TextIO, stdout: TextIO, stderr: TextIO) -> int:
     show_all = False
     almost_all = False
@@ -2648,6 +2773,7 @@ HELP_ITEMS: tuple[tuple[str, str, str], ...] = (
     ("umask", "umask [mode]", "Display or set the file creation mask."),
     ("times", "times", "Display process times."),
     ("hash", "hash [-r] [name ...]", "Remember or display command locations."),
+    ("history", "history [-c] [-d offset] [n]", "Display or edit the current interactive command history."),
     ("help", "help [name ...]", "Display this help text."),
     ("clear", "clear", "Clear the terminal using an ANSI fallback sequence."),
     ("base64", "base64 [-d|-D] [file ...]", "Encode or decode base64 data."),
@@ -2667,6 +2793,7 @@ HELP_ITEMS: tuple[tuple[str, str, str], ...] = (
     ("sort", "sort [-fnru] [-o file] [file ...]", "Sort text lines."),
     ("tar", "tar -cf|-xf|-tf archive [file ...]", "Create, extract, or list tar archives."),
     ("tr", "tr [-d] set1 [set2]", "Translate or delete characters."),
+    ("vi", "vi [file]", "Edit a file with the Windows-only fallback line editor when vi/vim is missing."),
     ("wc", "wc [-lwc] [file ...]", "Count lines, words, and bytes."),
     ("xargs", "xargs [-0] [-n count] [-I repl] [command ...]", "Build command lines from standard input."),
 )
@@ -2746,6 +2873,7 @@ INTERNAL_UTILITIES: dict[str, Utility] = {
     "uniq": utility_uniq,
     "unlink": utility_unlink,
     "updatedb": utility_updatedb,
+    "vi": utility_vi,
     "wc": utility_wc,
     "whoami": utility_whoami,
     "xargs": utility_xargs,

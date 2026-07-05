@@ -75,6 +75,7 @@ class Shell:
         self.last_status = 0
         self._last_external_output = ""
         self.functions: dict[str, FunctionDef] = {}
+        self.history: list[str] = []
         self.here_docs: dict[str, list[HereDoc]] = {}
         self.aliases: dict[str, str] = {}
         self.traps: dict[str, str] = {}
@@ -106,6 +107,7 @@ class Shell:
         )
         child.vars = self.vars.copy()
         child.functions = self.functions.copy()
+        child.history = self.history.copy()
         child.here_docs = {name: docs.copy() for name, docs in self.here_docs.items()}
         child.aliases = self.aliases.copy()
         child.traps = self.traps.copy()
@@ -888,6 +890,7 @@ class Shell:
                 status = 130
                 self.last_status = status
                 continue
+            self.add_history(candidate)
             try:
                 status = self.execute(candidate)
             except ShellExit as exc:
@@ -900,6 +903,11 @@ class Shell:
 
     def expand_prompt(self, prompt: str) -> str:
         return chars_to_text(expand_text(self, prompt, quoted=True))
+
+    def add_history(self, source: str) -> None:
+        entry = source.rstrip("\n")
+        if entry:
+            self.history.append(entry)
 
     def get_parameter(self, name: str, *, strict: bool = False) -> str:
         if name == "?":
@@ -965,10 +973,17 @@ class Shell:
             return name if os.path.exists(name) else None
         if name in self.command_hash and os.path.exists(self.command_hash[name]):
             return self.command_hash[name]
-        return shutil.which(name, path=env.get("PATH"))
+        path = shutil.which(name, path=env.get("PATH"))
+        if path:
+            return path
+        if os.name == "nt" and name == "vi":
+            return shutil.which("vim", path=env.get("PATH"))
+        return None
 
     def should_run_internal_utility(self, name: str, env: dict[str, str]) -> bool:
         if name not in INTERNAL_UTILITIES:
+            return False
+        if name == "vi" and os.name != "nt":
             return False
         return self.resolve_command(name, env) is None
 

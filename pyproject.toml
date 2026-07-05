@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "py-posix-shell"
-version = "0.4.5"
+version = "0.4.6"
 description = "A cross-platform POSIX-style shell written in Python."
 readme = "README.md"
 requires-python = ">=3.10"

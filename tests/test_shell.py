@@ -418,6 +418,38 @@ def test_repl_syntax_error_reports_and_keeps_session_alive(monkeypatch):
     assert "expected command after pipe" in errors
 
 
+def test_history_builtin_tracks_repl_commands(monkeypatch):
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    shell = Shell(stdout=stdout, stderr=stderr, interactive=True)
+    events = iter([
+        "echo one",
+        "echo two",
+        "history 2",
+        "history -d 1",
+        "history",
+        "history -c",
+        "history",
+        EOFError,
+    ])
+
+    def fake_input(_prompt):
+        event = next(events)
+        if isinstance(event, type) and issubclass(event, BaseException):
+            raise event
+        return event
+
+    monkeypatch.setattr("builtins.input", fake_input)
+
+    assert shell.repl() == 0
+    output = stdout.getvalue()
+    assert output.startswith("one\ntwo\n")
+    assert "    2  echo two\n    3  history 2\n" in output
+    assert "    1  echo two\n    2  history 2\n    3  history -d 1\n    4  history\n" in output
+    assert output.endswith("    1  history\n\n")
+    assert stderr.getvalue() == ""
+
+
 def test_py_web_ssh_cwd_prompt_injection_without_native_utilities(monkeypatch, tmp_path):
     token = "testtoken"
     stdout = io.StringIO()
@@ -576,12 +608,42 @@ def test_internal_help_utility_without_path():
     assert "These shell commands and fallback utilities are defined internally." in stdout
     assert "if COMMANDS; then COMMANDS;" in stdout
     assert "help [name ...]" in stdout
+    assert "history [-c] [-d offset] [n]" in stdout
     assert "cd [dir]\n    Change the current directory." in stdout
     assert "clear\n    Clear the terminal using an ANSI fallback sequence." in stdout
     assert "status:1\n" in stdout
     assert "\nhelp\n" in stdout
     assert "help is a shell utility" in stdout
     assert "help: no help topics match 'nope'\n" == stderr
+
+
+def test_windows_vi_fallback_without_path(tmp_path):
+    if os.name != "nt":
+        return
+    target = tmp_path / "note.txt"
+    script = f'printf "i\\nhello\\nworld\\n.\\nwq\\n" | vi "{target}"'
+    status, stdout, stderr, _shell = run_shell(script, env={"PATH": ""})
+    assert status == 0
+    assert target.read_text(encoding="utf-8") == "hello\nworld\n"
+    assert "py-posix-shell vi fallback" in stdout
+    assert "2 lines written" in stdout
+    assert stderr == ""
+
+
+def test_windows_vi_prefers_available_vim(monkeypatch):
+    if os.name != "nt":
+        return
+    shell = Shell(env={"PATH": "C:\\fake"})
+
+    def fake_which(name, path=None):
+        if name == "vim":
+            return "C:\\tools\\vim.exe"
+        return None
+
+    monkeypatch.setattr(shell_module.shutil, "which", fake_which)
+
+    assert shell.resolve_command("vi", shell.env) == "C:\\tools\\vim.exe"
+    assert shell.should_run_internal_utility("vi", shell.env) is False
 
 
 def test_internal_findutils_and_file_install_without_path(tmp_path):

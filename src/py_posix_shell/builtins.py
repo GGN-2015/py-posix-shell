@@ -205,6 +205,47 @@ def builtin_hash(shell, argv: list[str], stdin: TextIO, stdout: TextIO, stderr: 
     return status
 
 
+def builtin_history(shell, argv: list[str], stdin: TextIO, stdout: TextIO, stderr: TextIO) -> int:
+    args = argv[1:]
+    show_count: int | None = None
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        if arg == "-c":
+            shell.history.clear()
+            return 0
+        if arg == "-d":
+            index += 1
+            if index >= len(args):
+                stderr.write("history: -d: option requires an argument\n")
+                return 2
+            try:
+                offset = int(args[index])
+            except ValueError:
+                stderr.write(f"history: {args[index]}: numeric argument required\n")
+                return 2
+            if offset < 1 or offset > len(shell.history):
+                stderr.write(f"history: {offset}: history position out of range\n")
+                return 1
+            del shell.history[offset - 1]
+        elif arg.startswith("-"):
+            stderr.write(f"history: invalid option: {arg}\n")
+            return 2
+        else:
+            try:
+                show_count = int(arg)
+            except ValueError:
+                stderr.write(f"history: {arg}: numeric argument required\n")
+                return 2
+        index += 1
+
+    entries = shell.history[-show_count:] if show_count is not None else shell.history
+    start = len(shell.history) - len(entries) + 1
+    for number, entry in enumerate(entries, start):
+        stdout.write(f"{number:5d}  {entry}\n")
+    return 0
+
+
 def builtin_echo(shell, argv: list[str], stdin: TextIO, stdout: TextIO, stderr: TextIO) -> int:
     args = argv[1:]
     newline = True
@@ -828,6 +869,7 @@ BUILTINS: dict[str, Builtin] = {
     "umask": builtin_umask,
     "times": builtin_times,
     "hash": builtin_hash,
+    "history": builtin_history,
     "exit": builtin_exit,
     "return": builtin_return,
     "break": builtin_break,
