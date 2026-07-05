@@ -1858,20 +1858,14 @@ def utility_cut(shell, argv: list[str], stdin: TextIO, stdout: TextIO, stderr: T
 
 
 def utility_find(shell, argv: list[str], stdin: TextIO, stdout: TextIO, stderr: TextIO) -> int:
-    paths: list[str] = []
-    expr: list[str] = []
-    args = argv[1:] or ["."]
-    expression_markers = {"-name", "-iname", "-type", "-maxdepth", "-mindepth", "-print", "-delete", "-exec"}
-    for index, arg in enumerate(args):
-        if arg in expression_markers or arg in {"!", "-not", "-o", "-or", "-a", "-and"}:
-            expr = args[index:]
-            break
-        paths.append(arg)
-    if not paths:
-        paths = ["."]
-    predicates = parse_find_expression(expr, stderr)
-    if predicates is None:
+    try:
+        paths, expr, options = split_find_arguments(argv[1:])
+        program = parse_find_program(expr, options)
+    except ValueError as exc:
+        stderr.write(f"find: {exc}\n")
         return 2
+
+    runtime = FindRuntime(shell=shell, stdin=stdin, stdout=stdout, stderr=stderr)
     status = 0
     for root_text in paths:
         root = Path(root_text)
@@ -1879,31 +1873,11 @@ def utility_find(shell, argv: list[str], stdin: TextIO, stdout: TextIO, stderr: 
             stderr.write(f"find: '{root}': No such file or directory\n")
             status = 1
             continue
-        for path in iter_find_paths(root, predicates.maxdepth):
-            try:
-                depth = len(path.resolve().relative_to(root.resolve()).parts) if path != root else 0
-            except ValueError:
-                depth = max(0, len(path.parts) - len(root.parts))
-            if depth < predicates.mindepth:
-                continue
-            matched = find_matches(path, predicates)
-            if not matched:
-                continue
-            if predicates.delete:
-                try:
-                    if path.is_dir() and not path.is_symlink():
-                        path.rmdir()
-                    else:
-                        path.unlink()
-                except OSError as exc:
-                    stderr.write(f"find: cannot delete '{path}': {exc.strerror or exc}\n")
-                    status = 1
-                continue
-            if predicates.exec_command:
-                command = [str(path) if part == "{}" else part for part in predicates.exec_command]
-                status |= shell.run_preexpanded(command, stdin=stdin, stdout=stdout, stderr=stderr)
-            if predicates.print_result:
-                stdout.write(str(path) + "\n")
+        walk_find_tree(root, root_text, program, runtime)
+        if runtime.quit:
+            break
+    runtime.flush_exec_batches()
+    status |= runtime.status
     return status
 
 
@@ -2743,111 +2717,721 @@ def select_ranges(text: str, ranges: list[tuple[int | None, int | None]]) -> str
 
 
 @dataclass
-class FindPredicates:
-    names: list[str] = field(default_factory=list)
-    inames: list[str] = field(default_factory=list)
-    types: list[str] = field(default_factory=list)
+class FindOptions:
+    follow_symlinks: bool = False
     maxdepth: int | None = None
     mindepth: int = 0
-    delete: bool = False
-    exec_command: list[str] | None = None
-    print_result: bool = True
+    depth_first: bool = False
+    xdev: bool = False
 
 
-def parse_find_expression(expr: list[str], stderr: TextIO) -> FindPredicates | None:
-    predicates = FindPredicates()
-    explicit_action = False
-    i = 0
-    while i < len(expr):
-        token = expr[i]
-        if token in {"-a", "-and", "(", ")"}:
-            i += 1
-            continue
-        if token in {"-o", "-or", "!", "-not"}:
-            stderr.write(f"find: unsupported expression operator: {token}\n")
-            return None
-        if token in {"-name", "-iname", "-type", "-maxdepth", "-mindepth"}:
-            i += 1
-            if i >= len(expr):
-                stderr.write(f"find: missing argument to {token}\n")
-                return None
-            value = expr[i]
+@dataclass
+class FindProgram:
+    expression: "FindExpression"
+    options: FindOptions
+
+
+@dataclass
+class FindContext:
+    path: Path
+    display_path: str
+    depth: int
+    options: FindOptions
+    runtime: "FindRuntime"
+    pruned: bool = False
+
+
+@dataclass
+class FindRuntime:
+    shell: Any
+    stdin: TextIO
+    stdout: TextIO
+    stderr: TextIO
+    status: int = 0
+    quit: bool = False
+    exec_batches: dict[tuple[str, ...], list[str]] = field(default_factory=dict)
+
+    def run_exec(self, template: list[str], terminator: str, display_path: str) -> bool:
+        if terminator == "+":
+            self.exec_batches.setdefault(tuple(template), []).append(display_path)
+            return True
+        status = self.shell.run_preexpanded(
+            expand_find_exec_template(template, [display_path]),
+            stdin=self.stdin,
+            stdout=self.stdout,
+            stderr=self.stderr,
+        )
+        if status != 0:
+            self.status = status
+        return status == 0
+
+    def flush_exec_batches(self) -> None:
+        for template, paths in self.exec_batches.items():
+            if not paths:
+                continue
+            status = self.shell.run_preexpanded(
+                expand_find_exec_template(list(template), paths),
+                stdin=self.stdin,
+                stdout=self.stdout,
+                stderr=self.stderr,
+            )
+            if status != 0:
+                self.status = status
+        self.exec_batches.clear()
+
+
+class FindExpression:
+    def evaluate(self, context: FindContext) -> bool:
+        raise NotImplementedError
+
+
+@dataclass
+class FindConstant(FindExpression):
+    value: bool
+
+    def evaluate(self, context: FindContext) -> bool:
+        return self.value
+
+
+@dataclass
+class FindNot(FindExpression):
+    child: FindExpression
+
+    def evaluate(self, context: FindContext) -> bool:
+        return not self.child.evaluate(context)
+
+
+@dataclass
+class FindAnd(FindExpression):
+    left: FindExpression
+    right: FindExpression
+
+    def evaluate(self, context: FindContext) -> bool:
+        return self.left.evaluate(context) and self.right.evaluate(context)
+
+
+@dataclass
+class FindOr(FindExpression):
+    left: FindExpression
+    right: FindExpression
+
+    def evaluate(self, context: FindContext) -> bool:
+        return self.left.evaluate(context) or self.right.evaluate(context)
+
+
+@dataclass
+class FindComma(FindExpression):
+    left: FindExpression
+    right: FindExpression
+
+    def evaluate(self, context: FindContext) -> bool:
+        self.left.evaluate(context)
+        return self.right.evaluate(context)
+
+
+@dataclass
+class FindTest(FindExpression):
+    kind: str
+    value: Any = None
+
+    def evaluate(self, context: FindContext) -> bool:
+        return evaluate_find_test(self.kind, self.value, context)
+
+
+@dataclass
+class FindAction(FindExpression):
+    kind: str
+    value: Any = None
+
+    def evaluate(self, context: FindContext) -> bool:
+        if self.kind == "print":
+            context.runtime.stdout.write(context.display_path + "\n")
+            return True
+        if self.kind == "print0":
+            context.runtime.stdout.write(context.display_path + "\0")
+            return True
+        if self.kind == "ls":
+            context.runtime.stdout.write(format_long_listing(context.path, context.display_path) + "\n")
+            return True
+        if self.kind == "delete":
             try:
-                if token == "-name":
-                    predicates.names.append(value)
-                elif token == "-iname":
-                    predicates.inames.append(value.lower())
-                elif token == "-type":
-                    if value not in {"f", "d", "l"}:
-                        stderr.write(f"find: unknown file type: {value}\n")
-                        return None
-                    predicates.types.append(value)
-                elif token == "-maxdepth":
-                    predicates.maxdepth = int(value)
-                elif token == "-mindepth":
-                    predicates.mindepth = int(value)
-            except ValueError:
-                stderr.write(f"find: invalid number: {value}\n")
-                return None
-        elif token == "-print":
-            predicates.print_result = True
-            explicit_action = True
-        elif token == "-delete":
-            predicates.delete = True
-            predicates.print_result = False
-            explicit_action = True
-        elif token == "-exec":
+                if context.path.is_dir() and not context.path.is_symlink():
+                    context.path.rmdir()
+                else:
+                    context.path.unlink()
+                return True
+            except OSError as exc:
+                context.runtime.stderr.write(f"find: cannot delete '{context.display_path}': {exc.strerror or exc}\n")
+                context.runtime.status = 1
+                return False
+        if self.kind == "exec":
+            template, terminator = self.value
+            return context.runtime.run_exec(template, terminator, context.display_path)
+        if self.kind == "prune":
+            context.pruned = True
+            return True
+        if self.kind == "quit":
+            context.runtime.quit = True
+            return True
+        return False
+
+
+@dataclass(frozen=True)
+class FindNumberSpec:
+    op: str
+    value: int
+    unit: str = ""
+
+
+@dataclass(frozen=True)
+class FindModeSpec:
+    op: str
+    mode: int
+
+
+FIND_EXPRESSION_OPERATORS = {"!", "-not", "-a", "-and", "-o", "-or", ",", "(", ")"}
+FIND_PREDICATES_WITH_ARGS = {
+    "-name",
+    "-iname",
+    "-path",
+    "-ipath",
+    "-wholename",
+    "-iwholename",
+    "-regex",
+    "-iregex",
+    "-type",
+    "-size",
+    "-mtime",
+    "-mmin",
+    "-atime",
+    "-amin",
+    "-ctime",
+    "-cmin",
+    "-newer",
+    "-perm",
+    "-user",
+    "-group",
+    "-links",
+    "-maxdepth",
+    "-mindepth",
+    "-exec",
+}
+FIND_PREDICATES_WITHOUT_ARGS = {
+    "-true",
+    "-false",
+    "-empty",
+    "-readable",
+    "-writable",
+    "-executable",
+    "-print",
+    "-print0",
+    "-delete",
+    "-prune",
+    "-quit",
+    "-ls",
+    "-depth",
+    "-xdev",
+    "-mount",
+}
+FIND_EXPRESSION_STARTERS = FIND_EXPRESSION_OPERATORS | FIND_PREDICATES_WITH_ARGS | FIND_PREDICATES_WITHOUT_ARGS
+
+
+class FindExpressionParser:
+    def __init__(self, tokens: list[str], options: FindOptions):
+        self.tokens = tokens
+        self.options = options
+        self.index = 0
+        self.has_action = False
+        self.has_delete = False
+
+    def parse(self) -> FindExpression:
+        expression = self.parse_comma() if self.tokens else FindConstant(True)
+        if self.peek() is not None:
+            raise ValueError(f"unexpected token: {self.peek()}")
+        if not self.has_action:
+            expression = FindAnd(expression, FindAction("print"))
+        if self.has_delete:
+            self.options.depth_first = True
+        return expression
+
+    def peek(self) -> str | None:
+        return self.tokens[self.index] if self.index < len(self.tokens) else None
+
+    def pop(self) -> str:
+        token = self.tokens[self.index]
+        self.index += 1
+        return token
+
+    def require_argument(self, token: str) -> str:
+        if self.peek() is None:
+            raise ValueError(f"missing argument to {token}")
+        return self.pop()
+
+    def parse_comma(self) -> FindExpression:
+        expression = self.parse_or()
+        while self.peek() == ",":
+            self.pop()
+            expression = FindComma(expression, self.parse_or())
+        return expression
+
+    def parse_or(self) -> FindExpression:
+        expression = self.parse_and()
+        while self.peek() in {"-o", "-or"}:
+            self.pop()
+            expression = FindOr(expression, self.parse_and())
+        return expression
+
+    def parse_and(self) -> FindExpression:
+        expression = self.parse_not()
+        while True:
+            token = self.peek()
+            if token is None or token in {")", ",", "-o", "-or"}:
+                break
+            if token in {"-a", "-and"}:
+                self.pop()
+            expression = FindAnd(expression, self.parse_not())
+        return expression
+
+    def parse_not(self) -> FindExpression:
+        token = self.peek()
+        if token in {"!", "-not"}:
+            self.pop()
+            return FindNot(self.parse_not())
+        return self.parse_primary()
+
+    def parse_primary(self) -> FindExpression:
+        token = self.peek()
+        if token is None:
+            raise ValueError("expected expression")
+        if token == "(":
+            self.pop()
+            expression = self.parse_comma()
+            if self.peek() != ")":
+                raise ValueError("missing closing ')'")
+            self.pop()
+            return expression
+        if token == ")":
+            raise ValueError("unexpected ')'")
+        if token == ",":
+            raise ValueError("unexpected ','")
+        return self.parse_predicate()
+
+    def parse_predicate(self) -> FindExpression:
+        token = self.pop()
+        if token == "-true":
+            return FindConstant(True)
+        if token == "-false":
+            return FindConstant(False)
+        if token in {"-depth", "-xdev", "-mount"}:
+            if token == "-depth":
+                self.options.depth_first = True
+            else:
+                self.options.xdev = True
+            return FindConstant(True)
+        if token in {"-maxdepth", "-mindepth"}:
+            value = parse_find_nonnegative_int(self.require_argument(token), token)
+            if token == "-maxdepth":
+                self.options.maxdepth = value
+            else:
+                self.options.mindepth = value
+            return FindConstant(True)
+        if token in {"-name", "-iname", "-path", "-ipath", "-wholename", "-iwholename", "-regex", "-iregex", "-type"}:
+            value = self.require_argument(token)
+            if token == "-type":
+                types = set(value.split(",") if "," in value else value)
+                unknown = types - set("bcdflps")
+                if unknown:
+                    raise ValueError(f"unknown file type: {''.join(sorted(unknown))}")
+                return FindTest("type", types)
+            return FindTest(token[1:], value)
+        if token == "-size":
+            return FindTest("size", parse_find_size_spec(self.require_argument(token), token))
+        if token in {"-mtime", "-mmin", "-atime", "-amin", "-ctime", "-cmin", "-links"}:
+            return FindTest(token[1:], parse_find_number_spec(self.require_argument(token), token))
+        if token == "-newer":
+            newer_path = Path(self.require_argument(token))
+            try:
+                return FindTest("newer", newer_path.stat().st_mtime)
+            except OSError as exc:
+                raise ValueError(f"{newer_path}: {exc.strerror or exc}") from exc
+        if token == "-perm":
+            return FindTest("perm", parse_find_mode_spec(self.require_argument(token)))
+        if token in {"-user", "-group"}:
+            return FindTest(token[1:], self.require_argument(token))
+        if token in {"-empty", "-readable", "-writable", "-executable"}:
+            return FindTest(token[1:])
+        if token in {"-print", "-print0", "-delete", "-prune", "-quit", "-ls"}:
+            self.has_action = True
+            if token == "-delete":
+                self.has_delete = True
+            return FindAction(token[1:])
+        if token == "-exec":
             command: list[str] = []
-            i += 1
-            while i < len(expr) and expr[i] not in {";", "+"}:
-                command.append(expr[i])
-                i += 1
-            if i >= len(expr) or not command:
-                stderr.write("find: missing argument to -exec\n")
-                return None
-            predicates.exec_command = command
-            predicates.print_result = False
-            explicit_action = True
-        else:
-            stderr.write(f"find: unknown predicate: {token}\n")
-            return None
-        i += 1
-    if not explicit_action:
-        predicates.print_result = True
-    return predicates
+            terminator: str | None = None
+            while self.peek() is not None:
+                part = self.pop()
+                if part in {";", "+"}:
+                    terminator = part
+                    break
+                command.append(part)
+            if not command or terminator is None:
+                raise ValueError("missing argument to -exec")
+            if terminator == "+" and not any("{}" in part for part in command):
+                raise ValueError("missing '{}' in -exec command terminated by '+'")
+            self.has_action = True
+            return FindAction("exec", (command, terminator))
+        if token.startswith("-"):
+            raise ValueError(f"unknown predicate: {token}")
+        raise ValueError(f"paths must precede expression: {token}")
 
 
-def iter_find_paths(root: Path, maxdepth: int | None) -> Iterable[Path]:
-    yield root
-    if maxdepth == 0 or not root.is_dir() or root.is_symlink():
-        return
-    for current, dirs, files in os.walk(root):
-        current_path = Path(current)
-        try:
-            depth = len(current_path.resolve().relative_to(root.resolve()).parts)
-        except ValueError:
-            depth = max(0, len(current_path.parts) - len(root.parts))
-        if maxdepth is not None and depth >= maxdepth:
-            dirs[:] = []
+def split_find_arguments(args: list[str]) -> tuple[list[str], list[str], FindOptions]:
+    options = FindOptions()
+    index = 0
+    while index < len(args) and args[index] in {"-H", "-L", "-P"}:
+        option = args[index]
+        options.follow_symlinks = option in {"-H", "-L"}
+        index += 1
+
+    paths: list[str] = []
+    force_next_path = False
+    if index < len(args) and args[index] == "--":
+        force_next_path = True
+        index += 1
+
+    while index < len(args):
+        arg = args[index]
+        if force_next_path:
+            paths.append(arg)
+            force_next_path = False
+            index += 1
             continue
-        dirs.sort()
-        files.sort()
-        for directory in dirs:
-            yield current_path / directory
-        for file in files:
-            yield current_path / file
+        if arg == "--":
+            force_next_path = True
+            index += 1
+            continue
+        if is_find_expression_start(arg):
+            break
+        paths.append(arg)
+        index += 1
+
+    return paths or ["."], args[index:], options
 
 
-def find_matches(path: Path, predicates: FindPredicates) -> bool:
-    if predicates.names and not any(fnmatch.fnmatchcase(path.name, pattern) for pattern in predicates.names):
+def is_find_expression_start(arg: str) -> bool:
+    return arg in FIND_EXPRESSION_STARTERS or (arg.startswith("-") and arg != "-")
+
+
+def parse_find_program(expr: list[str], options: FindOptions) -> FindProgram:
+    parser = FindExpressionParser(expr, options)
+    return FindProgram(parser.parse(), options)
+
+
+def walk_find_tree(root: Path, root_text: str, program: FindProgram, runtime: FindRuntime) -> None:
+    try:
+        root_device = root.stat().st_dev if program.options.xdev else None
+    except OSError:
+        root_device = None
+
+    def walk(path: Path, depth: int) -> None:
+        if runtime.quit:
+            return
+        if program.options.maxdepth is not None and depth > program.options.maxdepth:
+            return
+
+        if program.options.depth_first:
+            if should_descend_find_path(path, depth, root_device, program.options):
+                for child in find_child_paths(path, runtime):
+                    walk(child, depth + 1)
+                    if runtime.quit:
+                        return
+            evaluate_find_path(path, root, root_text, depth, program, runtime)
+            return
+
+        context = evaluate_find_path(path, root, root_text, depth, program, runtime)
+        if runtime.quit or context.pruned:
+            return
+        if should_descend_find_path(path, depth, root_device, program.options):
+            for child in find_child_paths(path, runtime):
+                walk(child, depth + 1)
+                if runtime.quit:
+                    return
+
+    walk(root, 0)
+
+
+def evaluate_find_path(path: Path, root: Path, root_text: str, depth: int, program: FindProgram, runtime: FindRuntime) -> FindContext:
+    context = FindContext(
+        path=path,
+        display_path=format_find_display_path(path, root, root_text),
+        depth=depth,
+        options=program.options,
+        runtime=runtime,
+    )
+    if depth >= program.options.mindepth:
+        program.expression.evaluate(context)
+    return context
+
+
+def should_descend_find_path(path: Path, depth: int, root_device: int | None, options: FindOptions) -> bool:
+    if options.maxdepth is not None and depth >= options.maxdepth:
         return False
-    if predicates.inames and not any(fnmatch.fnmatchcase(path.name.lower(), pattern) for pattern in predicates.inames):
-        return False
-    if predicates.types:
-        path_type = "l" if path.is_symlink() else "d" if path.is_dir() else "f" if path.is_file() else ""
-        if path_type not in predicates.types:
+    try:
+        if options.xdev and root_device is not None and path.stat().st_dev != root_device:
             return False
-    return True
+        if path.is_symlink() and not options.follow_symlinks:
+            return False
+        return path.is_dir()
+    except OSError:
+        return False
+
+
+def find_child_paths(path: Path, runtime: FindRuntime) -> list[Path]:
+    try:
+        return sorted(path.iterdir(), key=lambda child: child.name)
+    except OSError as exc:
+        runtime.stderr.write(f"find: cannot read directory '{path}': {exc.strerror or exc}\n")
+        runtime.status = 1
+        return []
+
+
+def format_find_display_path(path: Path, root: Path, root_text: str) -> str:
+    if path == root:
+        return root_text or "."
+    try:
+        relative = path.relative_to(root)
+    except ValueError:
+        try:
+            relative = path.resolve().relative_to(root.resolve())
+        except (OSError, ValueError):
+            return str(path)
+    if root_text in {"", "."}:
+        return "." + os.sep + str(relative)
+    if root_text in {"./", ".\\"}:
+        return root_text.rstrip("/\\") + os.sep + str(relative)
+    return str(Path(root_text) / relative)
+
+
+def evaluate_find_test(kind: str, value: Any, context: FindContext) -> bool:
+    path = context.path
+    display = context.display_path
+    try:
+        if kind == "name":
+            return fnmatch.fnmatchcase(path.name, value)
+        if kind == "iname":
+            return fnmatch.fnmatchcase(path.name.lower(), value.lower())
+        if kind in {"path", "wholename"}:
+            return fnmatch.fnmatchcase(display, value)
+        if kind in {"ipath", "iwholename"}:
+            return fnmatch.fnmatchcase(display.lower(), value.lower())
+        if kind == "regex":
+            return re.fullmatch(value, display) is not None
+        if kind == "iregex":
+            return re.fullmatch(value, display, re.IGNORECASE) is not None
+        if kind == "type":
+            return find_file_type(path, context.options.follow_symlinks) in value
+        if kind == "size":
+            return match_find_size(find_path_stat(path, context.options).st_size, value)
+        if kind in {"mtime", "mmin", "atime", "amin", "ctime", "cmin"}:
+            return match_find_time(find_path_stat(path, context.options), kind, value)
+        if kind == "links":
+            return compare_find_number(getattr(find_path_stat(path, context.options), "st_nlink", 1), value)
+        if kind == "newer":
+            return find_path_stat(path, context.options).st_mtime > value
+        if kind == "perm":
+            return match_find_mode(stat.S_IMODE(find_path_stat(path, context.options).st_mode), value)
+        if kind == "user":
+            return match_find_user(find_path_stat(path, context.options), value)
+        if kind == "group":
+            return match_find_group(find_path_stat(path, context.options), value)
+        if kind == "empty":
+            return find_path_is_empty(path, context.options)
+        if kind == "readable":
+            return os.access(path, os.R_OK)
+        if kind == "writable":
+            return os.access(path, os.W_OK)
+        if kind == "executable":
+            return os.access(path, os.X_OK)
+    except OSError as exc:
+        context.runtime.stderr.write(f"find: '{display}': {exc.strerror or exc}\n")
+        context.runtime.status = 1
+    except re.error as exc:
+        context.runtime.stderr.write(f"find: invalid regular expression: {exc}\n")
+        context.runtime.status = 1
+    return False
+
+
+def find_path_stat(path: Path, options: FindOptions) -> os.stat_result:
+    return path.stat() if options.follow_symlinks else path.lstat()
+
+
+def find_file_type(path: Path, follow_symlinks: bool) -> str:
+    try:
+        mode = path.stat().st_mode if follow_symlinks else path.lstat().st_mode
+    except OSError:
+        return ""
+    if stat.S_ISBLK(mode):
+        return "b"
+    if stat.S_ISCHR(mode):
+        return "c"
+    if stat.S_ISDIR(mode):
+        return "d"
+    if stat.S_ISREG(mode):
+        return "f"
+    if stat.S_ISLNK(mode):
+        return "l"
+    if stat.S_ISFIFO(mode):
+        return "p"
+    if stat.S_ISSOCK(mode):
+        return "s"
+    return ""
+
+
+def find_path_is_empty(path: Path, options: FindOptions) -> bool:
+    info = find_path_stat(path, options)
+    if stat.S_ISDIR(info.st_mode):
+        try:
+            next(path.iterdir())
+            return False
+        except StopIteration:
+            return True
+    return getattr(info, "st_size", 0) == 0
+
+
+def parse_find_nonnegative_int(value: str, token: str) -> int:
+    try:
+        number = int(value, 10)
+    except ValueError as exc:
+        raise ValueError(f"invalid number for {token}: {value}") from exc
+    if number < 0:
+        raise ValueError(f"invalid number for {token}: {value}")
+    return number
+
+
+def parse_find_number_spec(value: str, token: str) -> FindNumberSpec:
+    op = "eq"
+    text = value
+    if text.startswith("+"):
+        op = "gt"
+        text = text[1:]
+    elif text.startswith("-"):
+        op = "lt"
+        text = text[1:]
+    if not text.isdigit():
+        raise ValueError(f"invalid number for {token}: {value}")
+    return FindNumberSpec(op, int(text))
+
+
+def parse_find_size_spec(value: str, token: str) -> FindNumberSpec:
+    op = "eq"
+    text = value
+    if text.startswith("+"):
+        op = "gt"
+        text = text[1:]
+    elif text.startswith("-"):
+        op = "lt"
+        text = text[1:]
+    match = re.fullmatch(r"(\d+)([bcwkMG]?)", text)
+    if not match:
+        raise ValueError(f"invalid size for {token}: {value}")
+    return FindNumberSpec(op, int(match.group(1)), match.group(2) or "b")
+
+
+def compare_find_number(observed: int, spec: FindNumberSpec) -> bool:
+    if spec.op == "gt":
+        return observed > spec.value
+    if spec.op == "lt":
+        return observed < spec.value
+    return observed == spec.value
+
+
+def match_find_size(size: int, spec: FindNumberSpec) -> bool:
+    units = {
+        "b": 512,
+        "c": 1,
+        "w": 2,
+        "k": 1024,
+        "M": 1024 * 1024,
+        "G": 1024 * 1024 * 1024,
+    }
+    unit = units.get(spec.unit, 512)
+    observed = size if unit == 1 else (size + unit - 1) // unit
+    return compare_find_number(observed, spec)
+
+
+def match_find_time(info: os.stat_result, kind: str, spec: FindNumberSpec) -> bool:
+    field = {"mtime": "st_mtime", "mmin": "st_mtime", "atime": "st_atime", "amin": "st_atime", "ctime": "st_ctime", "cmin": "st_ctime"}[kind]
+    unit_seconds = 60 if kind.endswith("min") else 24 * 60 * 60
+    age = max(0, int((time.time() - getattr(info, field)) // unit_seconds))
+    return compare_find_number(age, spec)
+
+
+def parse_find_mode_spec(value: str) -> FindModeSpec:
+    op = "eq"
+    text = value
+    if text.startswith("-"):
+        op = "all"
+        text = text[1:]
+    elif text.startswith("/"):
+        op = "any"
+        text = text[1:]
+    if not text or not all(char in "01234567" for char in text):
+        raise ValueError(f"unsupported permission mode: {value}")
+    return FindModeSpec(op, int(text, 8))
+
+
+def match_find_mode(mode: int, spec: FindModeSpec) -> bool:
+    if spec.op == "all":
+        return (mode & spec.mode) == spec.mode
+    if spec.op == "any":
+        return bool(mode & spec.mode)
+    return mode == spec.mode
+
+
+def match_find_user(info: os.stat_result, value: str) -> bool:
+    uid = getattr(info, "st_uid", None)
+    if value.isdigit():
+        return uid == int(value)
+    if pwd is not None and uid is not None:
+        try:
+            return pwd.getpwuid(uid).pw_name == value
+        except KeyError:
+            return False
+    try:
+        return getpass.getuser() == value
+    except OSError:
+        return False
+
+
+def match_find_group(info: os.stat_result, value: str) -> bool:
+    gid = getattr(info, "st_gid", None)
+    if value.isdigit():
+        return gid == int(value)
+    if grp is not None and gid is not None:
+        try:
+            return grp.getgrgid(gid).gr_name == value
+        except KeyError:
+            return False
+    return False
+
+
+def expand_find_exec_template(template: list[str], paths: list[str]) -> list[str]:
+    if len(paths) == 1:
+        return [part.replace("{}", paths[0]) for part in template]
+    command: list[str] = []
+    inserted = False
+    for part in template:
+        if "{}" not in part:
+            command.append(part)
+            continue
+        inserted = True
+        if part == "{}":
+            command.extend(paths)
+        else:
+            command.extend(part.replace("{}", path) for path in paths)
+    if not inserted:
+        command.extend(paths)
+    return command
 
 
 def locate_db_path() -> Path:

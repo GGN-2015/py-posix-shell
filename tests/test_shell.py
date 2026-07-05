@@ -1344,6 +1344,68 @@ unlink "{installed}"
     assert stderr == ""
 
 
+def test_internal_find_supports_common_gnu_style_expressions(tmp_path):
+    root = tmp_path / "tree"
+    src = root / "src"
+    build = root / "build"
+    src.mkdir(parents=True)
+    build.mkdir()
+    (src / "app.py").write_text("print('ok')\n", encoding="utf-8")
+    (src / "README.MD").write_text("readme\n", encoding="utf-8")
+    (src / "notes.txt").write_text("notes\n", encoding="utf-8")
+    (build / "generated.py").write_text("generated\n", encoding="utf-8")
+    (root / "empty").mkdir()
+    (root / "zero.txt").write_text("", encoding="utf-8")
+
+    status, stdout, stderr, _shell = run_shell(
+        f'''
+find "{root}" -maxdepth 2 \\( -name "*.py" -o -iname "readme.*" \\) -type f | sort
+printf "\\n--dirs--\\n"
+find "{root}" -mindepth 1 -maxdepth 1 -type d | sort
+printf "\\n--not-py--\\n"
+find "{root}" ! -name "*.py" -type f | sort
+printf "\\n--exec--\\n"
+find "{root}" -path "*src*" -type f -exec basename {{}} \\; | sort
+printf "\\n--empty0--\\n"
+find "{root}" -empty -print0
+''',
+        env={"PATH": ""},
+    )
+
+    assert status == 0
+    assert str(src / "README.MD") in stdout
+    assert str(src / "app.py") in stdout
+    assert str(build / "generated.py") in stdout
+    assert f"--dirs--\n{build}\n{root / 'empty'}\n{src}\n" in stdout
+    assert str(src / "notes.txt") in stdout
+    assert str(root / "zero.txt") in stdout
+    assert "--exec--\nREADME.MD\napp.py\nnotes.txt\n" in stdout
+    assert str(root / "empty") + "\0" in stdout
+    assert str(root / "zero.txt") + "\0" in stdout
+    assert stderr == ""
+
+
+def test_find_current_directory_keeps_dot_prefix(tmp_path):
+    (tmp_path / "one.txt").write_text("one\n", encoding="utf-8")
+    old_cwd = os.getcwd()
+    try:
+        os.chdir(tmp_path)
+        status, stdout, stderr, _shell = run_shell("find . -maxdepth 1 -type f", env={"PATH": ""})
+    finally:
+        os.chdir(old_cwd)
+
+    assert status == 0
+    assert stdout == "." + os.sep + "one.txt\n"
+    assert stderr == ""
+
+
+def test_windows_find_internal_fallback_replaces_system_find(monkeypatch):
+    monkeypatch.setattr(shell_module.os, "name", "nt")
+    shell = Shell(env={"PATH": r"C:\Windows\System32", "PATHEXT": ".EXE"})
+
+    assert shell.should_run_internal_utility("find", shell.env) is True
+
+
 def test_internal_diffutils_and_tar_without_path(tmp_path):
     left = tmp_path / "left.txt"
     right = tmp_path / "right.txt"

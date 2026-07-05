@@ -1271,6 +1271,8 @@ class Shell:
             return False
         if name == "ps" and os.name != "nt":
             return False
+        if name == "find" and os.name == "nt":
+            return True
         if name == "which":
             return os.name == "nt"
         return self.resolve_command(name, env) is None
