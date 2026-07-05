@@ -9,10 +9,12 @@ import datetime as _datetime
 import difflib
 import fnmatch
 import getpass
+import io
 import json
 import os
 import platform
 import re
+import select
 import shutil
 import signal
 import shlex
@@ -66,6 +68,16 @@ class ProcessInfo:
     rss: int = 0
     virtual_size: int = 0
     state: str = "S"
+
+
+@dataclass
+class TopOptions:
+    batch: bool = False
+    iterations: int | None = None
+    delay: float = 3.0
+    sort_key: str = "cpu"
+    pids: set[int] = field(default_factory=set)
+    user: str | None = None
 
 
 def utility_cat(shell, argv: list[str], stdin: TextIO, stdout: TextIO, stderr: TextIO) -> int:
@@ -1070,6 +1082,45 @@ def utility_which(shell, argv: list[str], stdin: TextIO, stdout: TextIO, stderr:
             else:
                 stdout.write(value + "\n")
     return status
+
+
+def utility_top(shell, argv: list[str], stdin: TextIO, stdout: TextIO, stderr: TextIO) -> int:
+    del shell
+    options = parse_top_options(argv, stderr)
+    if options is None:
+        return 2
+    if options == "help":
+        stdout.write("Usage: top [-b] [-n count] [-d seconds] [-o field] [-p pid[,pid]] [-u user]\n")
+        return 0
+
+    interactive = stream_is_tty(stdin) and stream_is_tty(stdout) and not options.batch
+    iterations = options.iterations if options.iterations is not None else (None if interactive else 1)
+    count = 0
+    if interactive:
+        enter_top_screen(stdout)
+    try:
+        while iterations is None or count < iterations:
+            text = render_top_snapshot(options, interactive=interactive)
+            if interactive:
+                stdout.write("\033[H\033[2J" + text)
+                stdout.flush()
+                if wait_for_top_quit(stdin, options.delay):
+                    break
+            else:
+                if count:
+                    stdout.write("\n")
+                stdout.write(text)
+                stdout.flush()
+                if iterations is None or count + 1 >= iterations:
+                    break
+                time.sleep(options.delay)
+            count += 1
+    except KeyboardInterrupt:
+        return 130
+    finally:
+        if interactive:
+            leave_top_screen(stdout)
+    return 0
 
 
 def utility_sleep(shell, argv: list[str], stdin: TextIO, stdout: TextIO, stderr: TextIO) -> int:
@@ -2404,6 +2455,14 @@ def stream_is_tty(stream: TextIO) -> bool:
         return False
 
 
+def stream_has_fileno(stream: TextIO) -> bool:
+    try:
+        stream.fileno()
+    except (AttributeError, OSError, io.UnsupportedOperation):
+        return False
+    return True
+
+
 def expand_tr_set(spec: str) -> str:
     result: list[str] = []
     index = 0
@@ -3259,6 +3318,543 @@ def parse_ps_mode(argv: list[str], stderr: TextIO) -> str | None:
     if saw_full:
         return "ef"
     return "default"
+
+
+def parse_top_options(argv: list[str], stderr: TextIO) -> TopOptions | str | None:
+    options = TopOptions()
+    index = 1
+    while index < len(argv):
+        arg = argv[index]
+        if arg == "--":
+            break
+        if arg in {"-h", "--help"}:
+            return "help"
+        if arg in {"-b", "--batch"}:
+            options.batch = True
+        elif arg in {"-n", "--iterations"}:
+            index += 1
+            if index >= len(argv):
+                stderr.write("top: option requires an argument -- n\n")
+                return None
+            count = parse_positive_int(argv[index])
+            if count is None:
+                stderr.write(f"top: invalid iteration count: {argv[index]}\n")
+                return None
+            options.iterations = count
+        elif arg.startswith("-n") and len(arg) > 2:
+            count = parse_positive_int(arg[2:])
+            if count is None:
+                stderr.write(f"top: invalid iteration count: {arg[2:]}\n")
+                return None
+            options.iterations = count
+        elif arg in {"-d", "--delay"}:
+            index += 1
+            if index >= len(argv):
+                stderr.write("top: option requires an argument -- d\n")
+                return None
+            delay = parse_nonnegative_float(argv[index])
+            if delay is None:
+                stderr.write(f"top: invalid delay: {argv[index]}\n")
+                return None
+            options.delay = delay
+        elif arg.startswith("-d") and len(arg) > 2:
+            delay = parse_nonnegative_float(arg[2:])
+            if delay is None:
+                stderr.write(f"top: invalid delay: {arg[2:]}\n")
+                return None
+            options.delay = delay
+        elif arg in {"-o", "--sort"}:
+            index += 1
+            if index >= len(argv):
+                stderr.write("top: option requires an argument -- o\n")
+                return None
+            options.sort_key = normalize_top_sort_key(argv[index])
+        elif arg.startswith("-o") and len(arg) > 2:
+            options.sort_key = normalize_top_sort_key(arg[2:])
+        elif arg in {"-p", "--pid"}:
+            index += 1
+            if index >= len(argv):
+                stderr.write("top: option requires an argument -- p\n")
+                return None
+            if not add_top_pids(options, argv[index], stderr):
+                return None
+        elif arg.startswith("-p") and len(arg) > 2:
+            if not add_top_pids(options, arg[2:], stderr):
+                return None
+        elif arg in {"-u", "--user"}:
+            index += 1
+            if index >= len(argv):
+                stderr.write("top: option requires an argument -- u\n")
+                return None
+            options.user = argv[index]
+        else:
+            stderr.write(f"top: unsupported option or operand: {arg}\n")
+            return None
+        index += 1
+    return options
+
+
+def parse_positive_int(value: str) -> int | None:
+    try:
+        number = int(value)
+    except ValueError:
+        return None
+    return number if number > 0 else None
+
+
+def parse_nonnegative_float(value: str) -> float | None:
+    try:
+        number = float(value)
+    except ValueError:
+        return None
+    return number if number >= 0 else None
+
+
+def add_top_pids(options: TopOptions, value: str, stderr: TextIO) -> bool:
+    for item in value.split(","):
+        if not item:
+            continue
+        pid = parse_positive_int(item)
+        if pid is None:
+            stderr.write(f"top: invalid pid: {item}\n")
+            return False
+        options.pids.add(pid)
+    return True
+
+
+def normalize_top_sort_key(value: str) -> str:
+    key = value.strip().lstrip("+-").lower()
+    aliases = {
+        "%cpu": "cpu",
+        "cpu": "cpu",
+        "%mem": "mem",
+        "mem": "mem",
+        "res": "mem",
+        "rss": "mem",
+        "time": "time",
+        "time+": "time",
+        "pid": "pid",
+        "command": "command",
+        "cmd": "command",
+    }
+    return aliases.get(key, "cpu")
+
+
+def render_top_snapshot(options: TopOptions, *, interactive: bool) -> str:
+    processes = collect_top_processes()
+    processes = filter_top_processes(processes, options)
+    processes = sort_top_processes(processes, options.sort_key)
+    columns, rows = shutil.get_terminal_size((100, 30))
+    header_lines = top_header_lines(processes)
+    max_rows = max(1, rows - len(header_lines) - 2) if interactive else min(30, max(1, len(processes)))
+    process_rows = [format_top_process_row(process) for process in processes[:max_rows]]
+    table = format_top_process_table(process_rows, columns)
+    lines = header_lines + table
+    if interactive:
+        lines.append("Press q to quit. Refresh interval: %.1fs" % options.delay)
+    return "\n".join(line[:columns] for line in lines) + "\n"
+
+
+def collect_top_processes() -> list[ProcessInfo]:
+    if os.name == "nt":
+        return collect_windows_processes(detailed=True) or collect_windows_processes(detailed=False) or [current_process_info()]
+    return collect_procfs_processes() or collect_ps_processes() or [current_process_info()]
+
+
+def filter_top_processes(processes: list[ProcessInfo], options: TopOptions) -> list[ProcessInfo]:
+    result = processes
+    if options.pids:
+        result = [process for process in result if process.pid in options.pids]
+    if options.user:
+        user = options.user.lower()
+        result = [process for process in result if process.user.lower() == user or process.user.lower().endswith("\\" + user)]
+    return result
+
+
+def sort_top_processes(processes: list[ProcessInfo], key: str) -> list[ProcessInfo]:
+    if key == "mem":
+        return sorted(processes, key=lambda process: (process.rss, process.pid), reverse=True)
+    if key == "time":
+        return sorted(processes, key=lambda process: (process.cpu_seconds, process.pid), reverse=True)
+    if key == "pid":
+        return sorted(processes, key=lambda process: process.pid)
+    if key == "command":
+        return sorted(processes, key=lambda process: (process.name.lower(), process.pid))
+    return sorted(processes, key=lambda process: (cpu_percent(process), process.cpu_seconds, process.pid), reverse=True)
+
+
+def top_header_lines(processes: list[ProcessInfo]) -> list[str]:
+    now = _datetime.datetime.now().strftime("%H:%M:%S")
+    uptime = format_uptime()
+    loads = format_load_average()
+    tasks = top_task_counts(processes)
+    cpu_line = top_cpu_line(processes)
+    mem_line, swap_line = top_memory_lines(processes)
+    return [
+        f"top - {now} up {uptime},  load average: {loads}",
+        "Tasks: {total:3d} total, {running:3d} running, {sleeping:3d} sleeping, {stopped:3d} stopped, {zombie:3d} zombie".format(**tasks),
+        cpu_line,
+        mem_line,
+        swap_line,
+    ]
+
+
+def top_task_counts(processes: list[ProcessInfo]) -> dict[str, int]:
+    running = sum(1 for process in processes if process.state.upper().startswith("R"))
+    stopped = sum(1 for process in processes if process.state.upper().startswith(("T", "SUSPENDED")))
+    zombie = sum(1 for process in processes if process.state.upper().startswith("Z"))
+    total = len(processes)
+    sleeping = max(0, total - running - stopped - zombie)
+    return {"total": total, "running": running, "sleeping": sleeping, "stopped": stopped, "zombie": zombie}
+
+
+def top_cpu_line(processes: list[ProcessInfo]) -> str:
+    used = min(100.0, sum(cpu_percent(process) for process in processes))
+    idle = max(0.0, 100.0 - used)
+    return f"%Cpu(s): {used:5.1f} us,   0.0 sy,   0.0 ni, {idle:5.1f} id,   0.0 wa,   0.0 hi,   0.0 si,   0.0 st"
+
+
+def top_memory_lines(processes: list[ProcessInfo]) -> tuple[str, str]:
+    memory = memory_snapshot()
+    total = memory["total"]
+    free = memory["free"]
+    used = memory["used"]
+    cached = memory["cached"]
+    swap_total = memory["swap_total"]
+    swap_free = memory["swap_free"]
+    if total <= 0:
+        used = sum(process.rss for process in processes)
+        total = max(used, 1)
+        free = 0
+        cached = 0
+    return (
+        f"MiB Mem : {bytes_to_mib(total):8.1f} total, {bytes_to_mib(free):8.1f} free, {bytes_to_mib(used):8.1f} used, {bytes_to_mib(cached):8.1f} buff/cache",
+        f"MiB Swap: {bytes_to_mib(swap_total):8.1f} total, {bytes_to_mib(swap_free):8.1f} free, {bytes_to_mib(max(0, swap_total - swap_free)):8.1f} used. {bytes_to_mib(free + cached):8.1f} avail Mem",
+    )
+
+
+def format_top_process_row(process: ProcessInfo) -> list[str]:
+    return [
+        str(process.pid),
+        truncate_top_user(process.user or "?", 12),
+        "20",
+        "0",
+        str(max(process.virtual_size, process.rss) // 1024),
+        str(process.rss // 1024),
+        "0",
+        top_state(process.state),
+        f"{cpu_percent(process):.1f}",
+        f"{memory_percent(process.rss, memory_snapshot().get('total', 0)):.1f}",
+        format_cpu_time(process.cpu_seconds),
+        process.cmd or process.name,
+    ]
+
+
+def format_top_process_table(rows: list[list[str]], columns: int) -> list[str]:
+    headers = ["PID", "USER", "PR", "NI", "VIRT", "RES", "SHR", "S", "%CPU", "%MEM", "TIME+", "COMMAND"]
+    table = [headers] + rows
+    widths = [max(len(row[index]) for row in table) for index in range(len(headers))]
+    right = {0, 2, 3, 4, 5, 6, 8, 9, 10}
+    lines: list[str] = []
+    for row in table:
+        parts = [
+            row[index].rjust(widths[index]) if index in right else row[index].ljust(widths[index])
+            for index in range(len(headers) - 1)
+        ]
+        prefix = " ".join(parts)
+        command_width = max(10, columns - len(prefix) - 1)
+        lines.append(prefix + " " + row[-1][:command_width])
+    return lines
+
+
+def top_state(state: str) -> str:
+    state = (state or "S").upper()
+    if state.startswith("RUN"):
+        return "R"
+    if state.startswith("SUSP") or state.startswith("T"):
+        return "T"
+    if state.startswith("Z"):
+        return "Z"
+    return state[:1] or "S"
+
+
+def truncate_top_user(user: str, width: int) -> str:
+    user = user.split("\\")[-1]
+    return user[: width - 1] + "+" if len(user) > width else user
+
+
+def enter_top_screen(stdout: TextIO) -> None:
+    stdout.write("\033[?1049h\033[?25l\033[H\033[2J")
+    stdout.flush()
+
+
+def leave_top_screen(stdout: TextIO) -> None:
+    stdout.write("\033[?25h\033[?1049l")
+    stdout.flush()
+
+
+def wait_for_top_quit(stdin: TextIO, delay: float) -> bool:
+    if os.name == "nt":
+        try:
+            import msvcrt
+        except ImportError:
+            time.sleep(delay)
+            return False
+        deadline = time.time() + delay
+        while time.time() < deadline:
+            if msvcrt.kbhit():
+                return msvcrt.getwch().lower() == "q"
+            time.sleep(0.05)
+        return False
+    if not stream_has_fileno(stdin):
+        time.sleep(delay)
+        return False
+    readable, _w, _x = select.select([stdin], [], [], delay)
+    if not readable:
+        return False
+    try:
+        return stdin.read(1).lower() == "q"
+    except OSError:
+        return False
+
+
+def collect_procfs_processes() -> list[ProcessInfo]:
+    proc = Path("/proc")
+    if not proc.exists():
+        return []
+    btime = proc_boot_time()
+    ticks = os.sysconf("SC_CLK_TCK") if hasattr(os, "sysconf") else 100
+    page_size = os.sysconf("SC_PAGE_SIZE") if hasattr(os, "sysconf") else 4096
+    processes: list[ProcessInfo] = []
+    for entry in proc.iterdir():
+        if not entry.name.isdigit():
+            continue
+        process = procfs_process_info(entry, btime=btime, ticks=ticks, page_size=page_size)
+        if process is not None:
+            processes.append(process)
+    return sorted(processes, key=lambda process: process.pid)
+
+
+def procfs_process_info(path: Path, *, btime: int, ticks: int, page_size: int) -> ProcessInfo | None:
+    try:
+        stat_text = (path / "stat").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    try:
+        close = stat_text.rindex(")")
+        pid_text, command = stat_text[:close].split("(", 1)
+        fields = stat_text[close + 2 :].split()
+        pid = int(pid_text.strip())
+        state = fields[0]
+        ppid = int(fields[1])
+        utime = int(fields[11])
+        stime = int(fields[12])
+        start_ticks = int(fields[19])
+        vsize = int(fields[20])
+        rss = int(fields[21]) * page_size
+    except (ValueError, IndexError):
+        return None
+    status = read_proc_status(path / "status")
+    cmd = read_proc_cmdline(path / "cmdline") or command
+    uid = status.get("Uid", "0").split()[0]
+    user = user_name_from_uid(uid)
+    rss = parse_kib(status.get("VmRSS")) or max(0, rss)
+    vsize = parse_kib(status.get("VmSize")) or max(0, vsize)
+    start_time = _datetime.datetime.fromtimestamp(btime + (start_ticks / ticks)) if btime else None
+    return ProcessInfo(pid, ppid, user, "?", (utime + stime) / ticks, start_time, cmd, command, rss=rss, virtual_size=vsize, state=state)
+
+
+def read_proc_status(path: Path) -> dict[str, str]:
+    result: dict[str, str] = {}
+    try:
+        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            if ":" in line:
+                key, value = line.split(":", 1)
+                result[key] = value.strip()
+    except OSError:
+        pass
+    return result
+
+
+def read_proc_cmdline(path: Path) -> str:
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return ""
+    return " ".join(part.decode("utf-8", errors="replace") for part in data.split(b"\0") if part)
+
+
+def proc_boot_time() -> int:
+    try:
+        for line in Path("/proc/stat").read_text(encoding="utf-8", errors="replace").splitlines():
+            if line.startswith("btime "):
+                return int(line.split()[1])
+    except (OSError, ValueError, IndexError):
+        pass
+    return 0
+
+
+def parse_kib(value: str | None) -> int:
+    if not value:
+        return 0
+    match = re.search(r"\d+", value)
+    return int(match.group()) * 1024 if match else 0
+
+
+def user_name_from_uid(uid_text: str) -> str:
+    if pwd is not None:
+        try:
+            return pwd.getpwuid(int(uid_text)).pw_name
+        except (KeyError, ValueError):
+            pass
+    return uid_text
+
+
+def collect_ps_processes() -> list[ProcessInfo]:
+    try:
+        completed = subprocess.run(
+            ["ps", "-axo", "pid=,ppid=,user=,stat=,rss=,vsz=,time=,command="],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    if completed.returncode != 0:
+        return []
+    processes: list[ProcessInfo] = []
+    for line in completed.stdout.splitlines():
+        parts = line.split(None, 7)
+        if len(parts) < 8:
+            continue
+        pid, ppid = safe_int(parts[0]), safe_int(parts[1])
+        if pid <= 0:
+            continue
+        processes.append(
+            ProcessInfo(
+                pid,
+                max(0, ppid),
+                parts[2],
+                "?",
+                parse_ps_time(parts[6]),
+                None,
+                parts[7],
+                command_name(parts[7]),
+                rss=safe_int(parts[4]) * 1024,
+                virtual_size=safe_int(parts[5]) * 1024,
+                state=parts[3][:1],
+            )
+        )
+    return sorted(processes, key=lambda process: process.pid)
+
+
+def parse_ps_time(value: str) -> float:
+    days = 0
+    if "-" in value:
+        day_text, value = value.split("-", 1)
+        days = safe_int(day_text)
+    parts = [safe_int(part) for part in value.split(":")]
+    if len(parts) == 3:
+        hours, minutes, seconds = parts
+    elif len(parts) == 2:
+        hours, minutes, seconds = 0, parts[0], parts[1]
+    else:
+        hours, minutes, seconds = 0, 0, parts[0] if parts else 0
+    return days * 86400 + hours * 3600 + minutes * 60 + seconds
+
+
+def format_uptime() -> str:
+    seconds = 0.0
+    try:
+        seconds = float(Path("/proc/uptime").read_text(encoding="utf-8").split()[0])
+    except (OSError, ValueError, IndexError):
+        pass
+    if seconds <= 0:
+        return "?"
+    days, remainder = divmod(int(seconds), 86400)
+    hours, remainder = divmod(remainder, 3600)
+    minutes = remainder // 60
+    if days:
+        return f"{days} day{'s' if days != 1 else ''}, {hours:02d}:{minutes:02d}"
+    return f"{hours:02d}:{minutes:02d}"
+
+
+def format_load_average() -> str:
+    try:
+        return ", ".join(f"{value:.2f}" for value in os.getloadavg())
+    except (AttributeError, OSError):
+        return "0.00, 0.00, 0.00"
+
+
+def memory_snapshot() -> dict[str, int]:
+    if os.name == "nt":
+        return windows_memory_snapshot()
+    meminfo = read_meminfo()
+    if meminfo:
+        total = meminfo.get("MemTotal", 0)
+        free = meminfo.get("MemAvailable", meminfo.get("MemFree", 0))
+        cached = meminfo.get("Buffers", 0) + meminfo.get("Cached", 0) + meminfo.get("SReclaimable", 0)
+        swap_total = meminfo.get("SwapTotal", 0)
+        swap_free = meminfo.get("SwapFree", 0)
+        return {
+            "total": total,
+            "free": free,
+            "used": max(0, total - free - cached),
+            "cached": cached,
+            "swap_total": swap_total,
+            "swap_free": swap_free,
+        }
+    return {"total": 0, "free": 0, "used": 0, "cached": 0, "swap_total": 0, "swap_free": 0}
+
+
+def read_meminfo() -> dict[str, int]:
+    result: dict[str, int] = {}
+    try:
+        for line in Path("/proc/meminfo").read_text(encoding="utf-8", errors="replace").splitlines():
+            if ":" not in line:
+                continue
+            key, value = line.split(":", 1)
+            result[key] = parse_kib(value)
+    except OSError:
+        pass
+    return result
+
+
+def windows_memory_snapshot() -> dict[str, int]:
+    if os.name != "nt":
+        return {"total": 0, "free": 0, "used": 0, "cached": 0, "swap_total": 0, "swap_free": 0}
+    try:
+        import ctypes
+    except ImportError:
+        return {"total": 0, "free": 0, "used": 0, "cached": 0, "swap_total": 0, "swap_free": 0}
+
+    class MemoryStatusEx(ctypes.Structure):
+        _fields_ = [
+            ("dwLength", ctypes.c_ulong),
+            ("dwMemoryLoad", ctypes.c_ulong),
+            ("ullTotalPhys", ctypes.c_ulonglong),
+            ("ullAvailPhys", ctypes.c_ulonglong),
+            ("ullTotalPageFile", ctypes.c_ulonglong),
+            ("ullAvailPageFile", ctypes.c_ulonglong),
+            ("ullTotalVirtual", ctypes.c_ulonglong),
+            ("ullAvailVirtual", ctypes.c_ulonglong),
+            ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+        ]
+
+    status = MemoryStatusEx()
+    status.dwLength = ctypes.sizeof(status)
+    if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+        return {"total": 0, "free": 0, "used": 0, "cached": 0, "swap_total": 0, "swap_free": 0}
+    total = int(status.ullTotalPhys)
+    free = int(status.ullAvailPhys)
+    swap_total = max(0, int(status.ullTotalPageFile) - total)
+    swap_free = max(0, int(status.ullAvailPageFile) - free)
+    return {"total": total, "free": free, "used": max(0, total - free), "cached": 0, "swap_total": swap_total, "swap_free": swap_free}
+
+
+def bytes_to_mib(value: int) -> float:
+    return max(0, value) / (1024 * 1024)
 
 
 def collect_windows_processes(*, detailed: bool) -> list[ProcessInfo]:
@@ -4199,6 +4795,7 @@ HELP_ITEMS: tuple[tuple[str, str, str], ...] = (
     ("sed", "sed [-n] [-e script] [script] [file ...]", "Run a stream editing script."),
     ("sort", "sort [-fnru] [-o file] [file ...]", "Sort text lines."),
     ("tar", "tar -cf|-xf|-tf archive [file ...]", "Create, extract, or list tar archives."),
+    ("top", "top [-b] [-n count] [-d seconds] [-o field] [-p pid[,pid]] [-u user]", "Display a live process table when native top is unavailable."),
     ("tr", "tr [-d] set1 [set2]", "Translate or delete characters."),
     ("vi", "vi [file]", "Edit a file with the Windows-only full-screen TTY fallback when vi/vim is missing."),
     ("wc", "wc [-lwc] [file ...]", "Count lines, words, and bytes."),
@@ -4277,6 +4874,7 @@ INTERNAL_UTILITIES: dict[str, Utility] = {
     "sort": utility_sort,
     "tail": utility_tail,
     "tar": utility_tar,
+    "top": utility_top,
     "touch": utility_touch,
     "tr": utility_tr,
     "uname": utility_uname,

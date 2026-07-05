@@ -409,6 +409,55 @@ def test_windows_ps_formats_linux_style_process_views(monkeypatch):
     assert stderr == ""
 
 
+def test_top_fallback_batch_snapshot(monkeypatch):
+    now = dt.datetime.now()
+    fake_processes = [
+        ProcessInfo(
+            pid=42,
+            ppid=1,
+            user="neko",
+            tty="?",
+            cpu_seconds=12,
+            start_time=now - dt.timedelta(minutes=5),
+            cmd="python app.py",
+            name="python",
+            rss=64 * 1024 * 1024,
+            virtual_size=128 * 1024 * 1024,
+            state="R",
+        ),
+        ProcessInfo(
+            pid=7,
+            ppid=1,
+            user="root",
+            tty="?",
+            cpu_seconds=1,
+            start_time=now - dt.timedelta(minutes=10),
+            cmd="service",
+            name="service",
+            rss=8 * 1024 * 1024,
+            virtual_size=32 * 1024 * 1024,
+            state="S",
+        ),
+    ]
+    monkeypatch.setattr(posix_utils, "collect_top_processes", lambda: fake_processes)
+    monkeypatch.setattr(
+        posix_utils,
+        "memory_snapshot",
+        lambda: {"total": 256 * 1024 * 1024, "free": 128 * 1024 * 1024, "used": 96 * 1024 * 1024, "cached": 32 * 1024 * 1024, "swap_total": 0, "swap_free": 0},
+    )
+
+    status, stdout, stderr, _shell = run_shell("top -b -n 1 -o pid", env={"PATH": ""})
+
+    assert status == 0
+    assert "top - " in stdout
+    assert "Tasks:" in stdout
+    assert "MiB Mem" in stdout
+    assert "PID USER" in stdout
+    assert "python app.py" in stdout
+    assert "service" in stdout
+    assert stderr == ""
+
+
 def test_ps_internal_fallback_is_windows_only(monkeypatch):
     monkeypatch.setattr(shell_module.os, "name", "posix")
     shell = Shell(env={"PATH": ""})
@@ -871,6 +920,7 @@ def test_internal_help_utility_without_path():
     assert "help [name ...]" in stdout
     assert "history [-c] [-d offset] [n]" in stdout
     assert "ps [aux|-ef]" in stdout
+    assert "top [-b] [-n count]" in stdout
     assert "which [-a] name ..." in stdout
     assert "cd [dir]\n    Change the current directory." in stdout
     assert "clear\n    Clear the terminal using an ANSI fallback sequence." in stdout
