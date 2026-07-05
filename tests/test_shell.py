@@ -11,7 +11,7 @@ import py_posix_shell.shell as shell_module
 from py_posix_shell.lexer import dump_tokens, lex
 from py_posix_shell.errors import ShellExit
 from py_posix_shell.posix_utils import ProcessInfo, StorageVolume, WindowsViEditor
-from py_posix_shell.shell import LineHistoryState, Shell
+from py_posix_shell.shell import LineHistoryState, Shell, terminal_display_width
 
 
 def run_shell(source: str, **kwargs):
@@ -577,6 +577,24 @@ def test_apply_history_navigation_redraws_line_and_beeps_at_edges():
     assert "\r$ much longer command" in output
     assert "\r$ short" in output
     assert output.endswith("\a")
+
+
+def test_input_backspace_erases_wide_character_cells():
+    stdout = io.StringIO()
+    shell = Shell(stdout=stdout, stderr=io.StringIO())
+
+    assert shell.erase_input_character("a中") == "a"
+    assert stdout.getvalue() == "\b\b  \b\b"
+
+
+def test_input_redraw_uses_terminal_display_width_for_cjk():
+    stdout = io.StringIO()
+    shell = Shell(stdout=stdout, stderr=io.StringIO())
+
+    shell.redraw_input_line("$ ", "echo 中文", "echo x")
+
+    assert terminal_display_width("echo 中文") == 9
+    assert stdout.getvalue().startswith("\r" + (" " * 11) + "\r$ echo x")
 
 
 def test_tab_completion_completes_single_file_and_common_prefix(tmp_path):

@@ -12,6 +12,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterator, TextIO
@@ -970,9 +971,7 @@ class Shell:
                 continue
             if char in {"\b", "\x7f"}:
                 if line:
-                    line = line[:-1]
-                    self.stdout.write("\b \b")
-                    self.stdout.flush()
+                    line = self.erase_input_character(line)
                 continue
             if char >= " ":
                 line += char
@@ -1005,9 +1004,7 @@ class Shell:
                     continue
                 if char in {"\b", "\x7f"}:
                     if line:
-                        line = line[:-1]
-                        self.stdout.write("\b \b")
-                        self.stdout.flush()
+                        line = self.erase_input_character(line)
                     continue
                 if char == "\x1b":
                     key = self.read_posix_escape_sequence()
@@ -1069,9 +1066,19 @@ class Shell:
         return " ".join(entry.splitlines())
 
     def redraw_input_line(self, prompt: str, old_line: str, new_line: str) -> None:
-        clear_width = len(prompt) + max(len(old_line), len(new_line))
+        clear_width = terminal_display_width(prompt) + max(
+            terminal_display_width(old_line),
+            terminal_display_width(new_line),
+        )
         self.stdout.write("\r" + (" " * clear_width) + "\r" + prompt + new_line)
         self.stdout.flush()
+
+    def erase_input_character(self, line: str) -> str:
+        char = line[-1]
+        width = max(1, terminal_display_width(char))
+        self.stdout.write(("\b" * width) + (" " * width) + ("\b" * width))
+        self.stdout.flush()
+        return line[:-1]
 
     def complete_line_for_tab(self, line: str) -> CompletionResult:
         if not line or line[-1].isspace():
@@ -1221,6 +1228,28 @@ def has_fileno(stream: TextIO) -> bool:
     except (AttributeError, OSError, io.UnsupportedOperation):
         return False
     return True
+
+
+def terminal_display_width(text: str) -> int:
+    width = 0
+    index = 0
+    while index < len(text):
+        char = text[index]
+        if char == "\033":
+            index += 1
+            if index < len(text) and text[index] == "[":
+                index += 1
+                while index < len(text) and not ("@" <= text[index] <= "~"):
+                    index += 1
+                index += 1
+                continue
+            continue
+        if unicodedata.combining(char):
+            index += 1
+            continue
+        width += 2 if unicodedata.east_asian_width(char) in {"F", "W"} else 1
+        index += 1
+    return width
 
 
 def normalize_redirection_target(target: str) -> str:
