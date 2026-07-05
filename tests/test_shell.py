@@ -9,7 +9,7 @@ import py_posix_shell.shell as shell_module
 from py_posix_shell.lexer import dump_tokens, lex
 from py_posix_shell.errors import ShellExit
 from py_posix_shell.posix_utils import WindowsViEditor
-from py_posix_shell.shell import Shell
+from py_posix_shell.shell import LineHistoryState, Shell
 
 
 def run_shell(source: str, **kwargs):
@@ -449,6 +449,52 @@ def test_history_builtin_tracks_repl_commands(monkeypatch):
     assert "    1  echo two\n    2  history 2\n    3  history -d 1\n    4  history\n" in output
     assert output.endswith("    1  history\n\n")
     assert stderr.getvalue() == ""
+
+
+def test_input_history_navigation_restores_current_line():
+    stdout = io.StringIO()
+    shell = Shell(stdout=stdout, stderr=io.StringIO())
+    shell.history = ["echo one", "echo two"]
+    state = LineHistoryState(index=len(shell.history))
+
+    line, moved = shell.navigate_input_history("echo draft", state, -1)
+    assert moved is True
+    assert line == "echo two"
+
+    line, moved = shell.navigate_input_history(line, state, -1)
+    assert moved is True
+    assert line == "echo one"
+
+    line, moved = shell.navigate_input_history(line, state, -1)
+    assert moved is False
+    assert line == "echo one"
+
+    line, moved = shell.navigate_input_history(line, state, 1)
+    assert moved is True
+    assert line == "echo two"
+
+    line, moved = shell.navigate_input_history(line, state, 1)
+    assert moved is True
+    assert line == "echo draft"
+
+
+def test_apply_history_navigation_redraws_line_and_beeps_at_edges():
+    stdout = io.StringIO()
+    shell = Shell(stdout=stdout, stderr=io.StringIO())
+    shell.history = ["short", "much longer command"]
+    state = LineHistoryState(index=len(shell.history))
+
+    line = shell.apply_history_navigation("$ ", "draft", state, -1)
+    assert line == "much longer command"
+    line = shell.apply_history_navigation("$ ", line, state, -1)
+    assert line == "short"
+    line = shell.apply_history_navigation("$ ", line, state, -1)
+    assert line == "short"
+
+    output = stdout.getvalue()
+    assert "\r$ much longer command" in output
+    assert "\r$ short" in output
+    assert output.endswith("\a")
 
 
 def test_tab_completion_completes_single_file_and_common_prefix(tmp_path):

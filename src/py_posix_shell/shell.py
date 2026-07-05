@@ -61,6 +61,12 @@ class CompletionResult:
     hidden_count: int = 0
 
 
+@dataclass
+class LineHistoryState:
+    index: int
+    saved_line: str = ""
+
+
 class Shell:
     def __init__(
         self,
@@ -940,10 +946,15 @@ class Shell:
         import msvcrt
 
         line = ""
+        history_state = LineHistoryState(index=len(self.history))
         while True:
             char = msvcrt.getwch()
             if char in {"\x00", "\xe0"}:
-                msvcrt.getwch()
+                code = msvcrt.getwch()
+                if code == "H":
+                    line = self.apply_history_navigation(prompt, line, history_state, -1)
+                elif code == "P":
+                    line = self.apply_history_navigation(prompt, line, history_state, 1)
                 continue
             if char == "\x03":
                 raise KeyboardInterrupt
@@ -975,6 +986,7 @@ class Shell:
         fd = sys.stdin.fileno()
         old_attrs = termios.tcgetattr(fd)
         line = ""
+        history_state = LineHistoryState(index=len(self.history))
         try:
             tty.setraw(fd)
             while True:
@@ -998,9 +1010,11 @@ class Shell:
                         self.stdout.flush()
                     continue
                 if char == "\x1b":
-                    # Drop simple escape sequences such as arrow keys.
-                    sys.stdin.read(1)
-                    sys.stdin.read(1)
+                    key = self.read_posix_escape_sequence()
+                    if key == "UP":
+                        line = self.apply_history_navigation(prompt, line, history_state, -1)
+                    elif key == "DOWN":
+                        line = self.apply_history_navigation(prompt, line, history_state, 1)
                     continue
                 if char >= " ":
                     line += char
@@ -1008,6 +1022,56 @@ class Shell:
                     self.stdout.flush()
         finally:
             termios.tcsetattr(fd, termios.TCSADRAIN, old_attrs)
+
+    def read_posix_escape_sequence(self) -> str | None:
+        if sys.stdin.read(1) != "[":
+            return None
+        code = sys.stdin.read(1)
+        if code == "A":
+            return "UP"
+        if code == "B":
+            return "DOWN"
+        return None
+
+    def apply_history_navigation(
+        self, prompt: str, line: str, state: LineHistoryState, direction: int
+    ) -> str:
+        old_line = line
+        line, moved = self.navigate_input_history(line, state, direction)
+        if moved:
+            self.redraw_input_line(prompt, old_line, line)
+        else:
+            self.stdout.write("\a")
+            self.stdout.flush()
+        return line
+
+    def navigate_input_history(
+        self, line: str, state: LineHistoryState, direction: int
+    ) -> tuple[str, bool]:
+        if not self.history:
+            return line, False
+        history_end = len(self.history)
+        if state.index == history_end:
+            state.saved_line = line
+        if direction < 0:
+            if state.index == 0:
+                return line, False
+            state.index -= 1
+            return self.history_entry_for_input(self.history[state.index]), True
+        if state.index >= history_end:
+            return line, False
+        state.index += 1
+        if state.index == history_end:
+            return state.saved_line, True
+        return self.history_entry_for_input(self.history[state.index]), True
+
+    def history_entry_for_input(self, entry: str) -> str:
+        return " ".join(entry.splitlines())
+
+    def redraw_input_line(self, prompt: str, old_line: str, new_line: str) -> None:
+        clear_width = len(prompt) + max(len(old_line), len(new_line))
+        self.stdout.write("\r" + (" " * clear_width) + "\r" + prompt + new_line)
+        self.stdout.flush()
 
     def complete_line_for_tab(self, line: str) -> CompletionResult:
         if not line or line[-1].isspace():
