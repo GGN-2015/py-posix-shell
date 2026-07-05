@@ -891,6 +891,35 @@ def test_windows_vi_editor_insert_mode_arrows(tmp_path):
     assert target.read_text(encoding="utf-8") == "abXc\n"
 
 
+def test_windows_vi_editor_render_shows_cursor_and_scrolls_horizontally(monkeypatch, tmp_path):
+    stdout = io.StringIO()
+    editor = WindowsViEditor(tmp_path / "note.txt", stdout, io.StringIO())
+    editor.lines = ["0123456789abc"]
+    editor.cursor_col = 12
+    monkeypatch.setattr(posix_utils.shutil, "get_terminal_size", lambda fallback: os.terminal_size((10, 5)))
+
+    editor.render()
+    rendered = stdout.getvalue()
+
+    assert "\033[?25l" in rendered
+    assert rendered.endswith("\033[?25h")
+    assert "3456789abc" in rendered
+    assert "\033[1;10H\033[?25h" in rendered
+    assert editor.left_col == 3
+
+
+def test_windows_vi_editor_render_uses_visual_tab_columns(monkeypatch, tmp_path):
+    stdout = io.StringIO()
+    editor = WindowsViEditor(tmp_path / "note.txt", stdout, io.StringIO())
+    editor.lines = ["\tab"]
+    editor.cursor_col = 1
+    monkeypatch.setattr(posix_utils.shutil, "get_terminal_size", lambda fallback: os.terminal_size((20, 5)))
+
+    editor.render()
+
+    assert "\033[1;5H\033[?25h" in stdout.getvalue()
+
+
 def test_windows_vi_prefers_available_vim(monkeypatch):
     if os.name != "nt":
         return

@@ -424,6 +424,7 @@ class WindowsViEditor:
         self.cursor_line = 0
         self.cursor_col = 0
         self.top_line = 0
+        self.left_col = 0
         self.mode = "NORMAL"
         self.command = ""
         self.status = "py-posix-shell vi fallback"
@@ -460,7 +461,7 @@ class WindowsViEditor:
 
     def enter_screen(self) -> None:
         self.enable_virtual_terminal()
-        self.stdout.write("\033[?1049h\033[?25l\033[2J\033[H")
+        self.stdout.write("\033[?1049h\033[?25h\033[2J\033[H")
         self.stdout.flush()
 
     def leave_screen(self) -> None:
@@ -510,12 +511,12 @@ class WindowsViEditor:
     def render(self) -> None:
         columns, rows = shutil.get_terminal_size((80, 24))
         text_rows = max(1, rows - 2)
-        self.keep_cursor_visible(text_rows)
-        self.stdout.write("\033[H")
+        self.keep_cursor_visible(text_rows, columns)
+        self.stdout.write("\033[?25l\033[H")
         for screen_row in range(text_rows):
             line_index = self.top_line + screen_row
             if line_index < len(self.lines):
-                text = self.display_line(self.lines[line_index])[:columns]
+                text = self.display_line(self.lines[line_index])[self.left_col : self.left_col + columns]
             else:
                 text = "~"
             self.stdout.write("\033[K" + text + "\n")
@@ -526,21 +527,38 @@ class WindowsViEditor:
         command_line = ":" + self.command if self.mode == "COMMAND" else self.status
         self.stdout.write("\033[K" + command_line[:columns])
         screen_y = self.cursor_line - self.top_line + 1
-        screen_x = min(self.cursor_col + 1, columns)
+        visual_col = self.visual_cursor_column(self.current_line(), self.cursor_col)
+        screen_x = max(1, min(visual_col - self.left_col + 1, columns))
         if self.mode == "COMMAND":
             screen_y = rows
             screen_x = min(len(self.command) + 2, columns)
-        self.stdout.write(f"\033[{screen_y};{screen_x}H")
+        self.stdout.write(f"\033[{screen_y};{screen_x}H\033[?25h")
         self.stdout.flush()
 
     def display_line(self, line: str) -> str:
         return "".join(char if char >= " " else " " for char in line.expandtabs(4))
 
-    def keep_cursor_visible(self, text_rows: int) -> None:
+    def visual_cursor_column(self, line: str, column: int) -> int:
+        visual_col = 0
+        for char in line[:column]:
+            if char == "\t":
+                visual_col += 4 - (visual_col % 4)
+            else:
+                visual_col += 1
+        return visual_col
+
+    def keep_cursor_visible(self, text_rows: int, columns: int) -> None:
         if self.cursor_line < self.top_line:
             self.top_line = self.cursor_line
         elif self.cursor_line >= self.top_line + text_rows:
             self.top_line = self.cursor_line - text_rows + 1
+        visual_col = self.visual_cursor_column(self.current_line(), self.cursor_col)
+        if visual_col < self.left_col:
+            self.left_col = visual_col
+        elif visual_col >= self.left_col + columns:
+            self.left_col = visual_col - columns + 1
+        if self.visual_cursor_column(self.current_line(), len(self.current_line())) < columns:
+            self.left_col = 0
 
     def handle_key(self, key: str) -> None:
         if self.mode == "INSERT":
