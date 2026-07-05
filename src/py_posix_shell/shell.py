@@ -38,7 +38,7 @@ from .parser import (
     SubshellCommand,
     parse,
 )
-from .posix_utils import INTERNAL_UTILITIES
+from .posix_utils import INTERNAL_UTILITIES, executable_path_candidates, find_executable_matches, is_executable_file, normalize_path_entry
 
 
 @dataclass
@@ -52,6 +52,51 @@ class ExpandedCommand:
 class HereDoc:
     body: str
     expand: bool
+
+
+PipelineValue = str | bytes
+
+
+class PipelineBinaryBuffer:
+    def __init__(self, owner: "PipelineCapture") -> None:
+        self.owner = owner
+
+    def write(self, data: bytes | bytearray | memoryview) -> int:
+        chunk = bytes(data)
+        self.owner.write_bytes(chunk)
+        return len(chunk)
+
+    def flush(self) -> None:
+        pass
+
+
+class PipelineCapture(io.StringIO):
+    def __init__(self) -> None:
+        super().__init__()
+        self._binary = False
+        self._bytes = bytearray()
+        self.buffer = PipelineBinaryBuffer(self)
+
+    def write(self, text: str) -> int:
+        if self._binary:
+            self._bytes.extend(text.encode("utf-8"))
+            return len(text)
+        return super().write(text)
+
+    def write_bytes(self, data: bytes) -> None:
+        if not self._binary:
+            existing = super().getvalue()
+            if existing:
+                self._bytes.extend(existing.encode("utf-8"))
+            super().seek(0)
+            super().truncate(0)
+            self._binary = True
+        self._bytes.extend(data)
+
+    def get_pipeline_value(self) -> PipelineValue:
+        if self._binary:
+            return bytes(self._bytes)
+        return super().getvalue()
 
 
 @dataclass(frozen=True)
@@ -226,7 +271,7 @@ class Shell:
             status, _output = self.execute_command(pipeline.commands[0])
             return invert_status(status) if pipeline.negated else status
 
-        input_text: str | None = None
+        input_text: PipelineValue | None = None
         status = 0
         for index, command in enumerate(pipeline.commands):
             capture_stdout = index < len(pipeline.commands) - 1
@@ -246,10 +291,10 @@ class Shell:
         self,
         command: Command,
         *,
-        pipeline_input: str | None = None,
+        pipeline_input: PipelineValue | None = None,
         capture_stdout: bool = False,
         in_pipeline: bool = False,
-    ) -> tuple[int, str]:
+    ) -> tuple[int, PipelineValue]:
         if isinstance(command, SimpleCommand):
             return self.execute_simple(
                 command,
@@ -271,13 +316,13 @@ class Shell:
         self,
         command: Command,
         *,
-        pipeline_input: str | None = None,
+        pipeline_input: PipelineValue | None = None,
         capture_stdout: bool = False,
         in_pipeline: bool = False,
-    ) -> tuple[int, str]:
+    ) -> tuple[int, PipelineValue]:
         redirections = self.expand_redirections(getattr(command, "redirections", ()))
-        stdin = io.StringIO(pipeline_input) if pipeline_input is not None else self.stdin
-        stdout_buffer = io.StringIO() if capture_stdout else None
+        stdin = pipeline_input_stream(pipeline_input) if pipeline_input is not None else self.stdin
+        stdout_buffer = PipelineCapture() if capture_stdout else None
         stdout = stdout_buffer if stdout_buffer is not None else self.stdout
         target = self.clone(stdout=stdout) if in_pipeline or isinstance(command, SubshellCommand) else self
 
@@ -288,7 +333,7 @@ class Shell:
         except OSError as exc:
             self.stderr.write(f"{self.argv0}: {exc}\n")
             status = 1
-        return status, stdout_buffer.getvalue() if stdout_buffer is not None else ""
+        return status, stdout_buffer.get_pipeline_value() if stdout_buffer is not None else ""
 
     def execute_compound_body(self, command: Command) -> int:
         if isinstance(command, IfCommand):
@@ -380,10 +425,10 @@ class Shell:
         self,
         command: SimpleCommand,
         *,
-        pipeline_input: str | None = None,
+        pipeline_input: PipelineValue | None = None,
         capture_stdout: bool = False,
         in_pipeline: bool = False,
-    ) -> tuple[int, str]:
+    ) -> tuple[int, PipelineValue]:
         try:
             expanded = self.expand_command(command)
         except ExpansionError as exc:
@@ -484,12 +529,12 @@ class Shell:
         name: str,
         expanded: ExpandedCommand,
         *,
-        pipeline_input: str | None,
+        pipeline_input: PipelineValue | None,
         capture_stdout: bool,
         in_pipeline: bool,
-    ) -> tuple[int, str]:
-        stdin = io.StringIO(pipeline_input) if pipeline_input is not None else self.stdin
-        stdout_buffer = io.StringIO() if capture_stdout else None
+    ) -> tuple[int, PipelineValue]:
+        stdin = pipeline_input_stream(pipeline_input) if pipeline_input is not None else self.stdin
+        stdout_buffer = PipelineCapture() if capture_stdout else None
         stdout = stdout_buffer if stdout_buffer is not None else self.stdout
         restore: dict[str, tuple[bool, str, bool]] = {}
         persist_assignments = (name in SPECIAL_BUILTINS) and not in_pipeline
@@ -522,20 +567,20 @@ class Shell:
                 else:
                     self.unset_parameter(var_name)
 
-        return status, stdout_buffer.getvalue() if stdout_buffer is not None else ""
+        return status, stdout_buffer.get_pipeline_value() if stdout_buffer is not None else ""
 
     def run_alias_command(
         self,
         name: str,
         expanded: ExpandedCommand,
         *,
-        pipeline_input: str | None,
+        pipeline_input: PipelineValue | None,
         capture_stdout: bool,
         in_pipeline: bool,
-    ) -> tuple[int, str]:
+    ) -> tuple[int, PipelineValue]:
         target = self.clone() if in_pipeline else self
-        stdin = io.StringIO(pipeline_input) if pipeline_input is not None else target.stdin
-        stdout_buffer = io.StringIO() if capture_stdout else None
+        stdin = pipeline_input_stream(pipeline_input) if pipeline_input is not None else target.stdin
+        stdout_buffer = PipelineCapture() if capture_stdout else None
         stdout = stdout_buffer if stdout_buffer is not None else target.stdout
         restore: dict[str, tuple[bool, str, bool]] = {}
 
@@ -566,18 +611,18 @@ class Shell:
                 else:
                     target.unset_parameter(var_name)
 
-        return status, stdout_buffer.getvalue() if stdout_buffer is not None else ""
+        return status, stdout_buffer.get_pipeline_value() if stdout_buffer is not None else ""
 
     def run_internal_utility_command(
         self,
         expanded: ExpandedCommand,
         *,
-        pipeline_input: str | None,
+        pipeline_input: PipelineValue | None,
         capture_stdout: bool,
-    ) -> tuple[int, str]:
+    ) -> tuple[int, PipelineValue]:
         name = expanded.argv[0]
-        stdin = io.StringIO(pipeline_input) if pipeline_input is not None else self.stdin
-        stdout_buffer = io.StringIO() if capture_stdout else None
+        stdin = pipeline_input_stream(pipeline_input) if pipeline_input is not None else self.stdin
+        stdout_buffer = PipelineCapture() if capture_stdout else None
         stdout = stdout_buffer if stdout_buffer is not None else self.stdout
         restore_env: dict[str, tuple[bool, str]] = {}
 
@@ -598,21 +643,21 @@ class Shell:
                 else:
                     self.env.pop(var_name, None)
 
-        return status, stdout_buffer.getvalue() if stdout_buffer is not None else ""
+        return status, stdout_buffer.get_pipeline_value() if stdout_buffer is not None else ""
 
     def run_function_command(
         self,
         name: str,
         expanded: ExpandedCommand,
         *,
-        pipeline_input: str | None,
+        pipeline_input: PipelineValue | None,
         capture_stdout: bool,
         in_pipeline: bool,
-    ) -> tuple[int, str]:
+    ) -> tuple[int, PipelineValue]:
         function = self.functions[name]
         target = self.clone() if in_pipeline else self
-        stdin = io.StringIO(pipeline_input) if pipeline_input is not None else target.stdin
-        stdout_buffer = io.StringIO() if capture_stdout else None
+        stdin = pipeline_input_stream(pipeline_input) if pipeline_input is not None else target.stdin
+        stdout_buffer = PipelineCapture() if capture_stdout else None
         stdout = stdout_buffer if stdout_buffer is not None else target.stdout
         restore: dict[str, tuple[bool, str, bool]] = {}
 
@@ -649,15 +694,15 @@ class Shell:
                 else:
                     target.unset_parameter(var_name)
 
-        return status, stdout_buffer.getvalue() if stdout_buffer is not None else ""
+        return status, stdout_buffer.get_pipeline_value() if stdout_buffer is not None else ""
 
     def run_external_command(
         self,
         expanded: ExpandedCommand,
         *,
-        pipeline_input: str | None = None,
+        pipeline_input: PipelineValue | None = None,
         capture_stdout: bool = False,
-    ) -> tuple[int, str]:
+    ) -> tuple[int, PipelineValue]:
         env = dict(self.env)
         env.update(expanded.assignments)
         if self.should_run_internal_utility(expanded.argv[0], env):
@@ -692,7 +737,7 @@ class Shell:
         stdin: TextIO | None = None,
         stdout: TextIO | None = None,
         stderr: TextIO | None = None,
-        input_text: str | None = None,
+        input_text: PipelineValue | None = None,
         capture_stdout: bool = False,
     ) -> int:
         if not argv:
@@ -719,11 +764,16 @@ class Shell:
         popen_stdout: object = stdout
         popen_stderr: object = stderr
         communicate_input = input_text
+        binary_process = isinstance(input_text, bytes) or capture_stdout
 
         if input_text is not None:
+            if binary_process and isinstance(communicate_input, str):
+                communicate_input = communicate_input.encode("utf-8")
             popen_stdin = subprocess.PIPE
         elif not has_fileno(stdin):
             communicate_input = stdin.read()
+            if binary_process:
+                communicate_input = communicate_input.encode("utf-8")
             popen_stdin = subprocess.PIPE
 
         stdout_capture_target: TextIO | None = None
@@ -739,13 +789,14 @@ class Shell:
             popen_stderr = subprocess.PIPE
 
         try:
+            command_argv = subprocess_argv_for_windows_script(executable, argv[1:]) if is_windows_batch_file(executable) else [executable, *argv[1:]]
             process = subprocess.Popen(
-                [executable, *argv[1:]],
+                command_argv,
                 stdin=popen_stdin,
                 stdout=popen_stdout,
                 stderr=popen_stderr,
                 env=env,
-                text=True,
+                text=not binary_process,
             )
             completed_stdout, completed_stderr = process.communicate(input=communicate_input)
         except PermissionError:
@@ -768,9 +819,9 @@ class Shell:
         else:
             self._last_external_output = ""
         if stdout_capture_target is not None and completed_stdout:
-            stdout_capture_target.write(completed_stdout)
+            write_pipeline_process_output(stdout_capture_target, completed_stdout)
         if stderr_capture_target is not None and completed_stderr:
-            stderr_capture_target.write(completed_stderr)
+            write_pipeline_process_output(stderr_capture_target, completed_stderr)
         return normalize_process_status(process.returncode)
 
     def run_preexpanded(self, argv: list[str], *, stdin: TextIO, stdout: TextIO, stderr: TextIO) -> int:
@@ -1186,13 +1237,28 @@ class Shell:
 
     def resolve_command(self, name: str, env: dict[str, str]) -> str | None:
         if any(sep in name for sep in ("/", "\\")):
-            return name if os.path.exists(name) else None
-        if name in self.command_hash and os.path.exists(self.command_hash[name]):
-            return self.command_hash[name]
-        path = shutil.which(name, path=env.get("PATH"))
-        if path:
-            return path
+            native = normalize_path_entry(name)
+            if os.path.exists(native):
+                return os.path.abspath(native)
+            for candidate in executable_path_candidates(name, env):
+                if is_executable_file(candidate):
+                    return os.path.abspath(candidate)
+            return None
+        if name in self.command_hash:
+            cached = normalize_path_entry(self.command_hash[name])
+            if os.path.exists(cached):
+                return cached
+        matches = find_executable_matches(name, env)
+        if matches:
+            return matches[0]
+        if os.name == "nt":
+            for candidate in executable_path_candidates(os.path.join(".", name), env):
+                if is_executable_file(candidate):
+                    return os.path.abspath(candidate)
         if os.name == "nt" and name == "vi":
+            vim_matches = find_executable_matches("vim", env)
+            if vim_matches:
+                return vim_matches[0]
             return shutil.which("vim", path=env.get("PATH"))
         return None
 
@@ -1230,6 +1296,41 @@ def has_fileno(stream: TextIO) -> bool:
     except (AttributeError, OSError, io.UnsupportedOperation):
         return False
     return True
+
+
+def pipeline_input_stream(value: PipelineValue) -> TextIO:
+    if isinstance(value, bytes):
+        return io.TextIOWrapper(io.BytesIO(value), encoding="utf-8", errors="replace", newline="")
+    return io.StringIO(value)
+
+
+def write_pipeline_process_output(stream: TextIO, output: str | bytes) -> None:
+    if isinstance(output, str):
+        stream.write(output)
+        return
+    buffer = getattr(stream, "buffer", None)
+    if buffer is not None:
+        buffer.write(output)
+        buffer.flush()
+    else:
+        stream.write(output.decode("utf-8", errors="replace"))
+
+
+def is_windows_batch_file(path: str) -> bool:
+    return os.name == "nt" and os.path.splitext(path)[1].lower() in {".bat", ".cmd"}
+
+
+def subprocess_argv_for_windows_script(executable: str, args: list[str]) -> list[str]:
+    command = " ".join(cmd_quote(arg) for arg in [executable, *args])
+    return [os.environ.get("COMSPEC", "cmd.exe"), "/d", "/s", "/c", command]
+
+
+def cmd_quote(value: str) -> str:
+    if value == "":
+        return '""'
+    if not any(char.isspace() or char in '"&()[]{}^=;!%+`,~|' for char in value):
+        return value
+    return '"' + value.replace('"', r'\"') + '"'
 
 
 def terminal_display_width(text: str) -> int:

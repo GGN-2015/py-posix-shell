@@ -22,6 +22,11 @@ def run_shell(source: str, **kwargs):
     return status, stdout.getvalue(), stderr.getvalue(), shell
 
 
+class TtyStringIO(io.StringIO):
+    def isatty(self):
+        return True
+
+
 def test_lexer_keeps_quotes_and_operators():
     assert dump_tokens(lex("echo 'a b' \"$HOME\" && false")) == [
         "word:echo",
@@ -30,6 +35,14 @@ def test_lexer_keeps_quotes_and_operators():
         "op:&&",
         "word:false",
     ]
+
+
+def test_lexer_preserves_windows_current_directory_backslash():
+    if os.name != "nt":
+        return
+
+    assert dump_tokens(lex(r".\build_windows.bat")) == [r"word:.\build_windows.bat"]
+    assert dump_tokens(lex(r"..\tools\build.cmd")) == [r"word:..\tools\build.cmd"]
 
 
 def test_assignment_and_parameter_expansion():
@@ -170,6 +183,144 @@ eval 'echo eval:$from_dot'
     status, stdout, stderr, _shell = run_shell(script)
     assert status == 0
     assert stdout == "ok:4\narg:a b\narg:c\neval:ok\n"
+    assert stderr == ""
+
+
+def test_unset_f_removes_shell_function_and_command_queries():
+    script = """
+__pysh_activate_fn() { :; }
+__pysh_keep_fn() { :; }
+__pysh_var=value
+command -v __pysh_activate_fn
+command -V __pysh_activate_fn
+type __pysh_activate_fn
+unset -f __pysh_activate_fn
+command -v __pysh_activate_fn || echo gone
+unset -f __pysh_keep_fn -v __pysh_var
+command -v __pysh_keep_fn || echo keep-gone
+echo "${__pysh_var:-var-gone}"
+"""
+    status, stdout, stderr, _shell = run_shell(script)
+
+    assert status == 0
+    assert stdout == (
+        "__pysh_activate_fn\n"
+        "__pysh_activate_fn is a shell function\n"
+        "__pysh_activate_fn is a shell function\n"
+        "gone\n"
+        "keep-gone\n"
+        "var-gone\n"
+    )
+    assert stderr == ""
+
+
+def test_source_windows_venv_activate_script_updates_path_and_deactivate(tmp_path):
+    if os.name != "nt":
+        return
+
+    venv = tmp_path / "venv"
+    scripts_dir = venv / "Scripts"
+    scripts_dir.mkdir(parents=True)
+    fake_python = scripts_dir / "python.exe"
+    fake_python.write_text("", encoding="utf-8")
+    venv_text = str(venv)
+    quoted_venv = venv_text.replace("'", "'\"'\"'")
+    activate = tmp_path / "activate"
+    activate.write_text(
+        f"""
+deactivate () {{
+    if [ -n "${{_OLD_VIRTUAL_PATH:-}}" ] ; then
+        PATH="${{_OLD_VIRTUAL_PATH:-}}"
+        export PATH
+        unset _OLD_VIRTUAL_PATH
+    fi
+    if [ -n "${{_OLD_VIRTUAL_PYTHONHOME:-}}" ] ; then
+        PYTHONHOME="${{_OLD_VIRTUAL_PYTHONHOME:-}}"
+        export PYTHONHOME
+        unset _OLD_VIRTUAL_PYTHONHOME
+    fi
+    hash -r 2> /dev/null
+    if [ -n "${{_OLD_VIRTUAL_PS1:-}}" ] ; then
+        PS1="${{_OLD_VIRTUAL_PS1:-}}"
+        export PS1
+        unset _OLD_VIRTUAL_PS1
+    fi
+    unset VIRTUAL_ENV
+    unset VIRTUAL_ENV_PROMPT
+    if [ ! "${{1:-}}" = "nondestructive" ] ; then
+        unset -f deactivate
+    fi
+}}
+
+deactivate nondestructive
+
+case "$(uname)" in
+    CYGWIN*|MSYS*|MINGW*)
+        VIRTUAL_ENV=$(cygpath '{quoted_venv}')
+        export VIRTUAL_ENV
+        ;;
+    *)
+        export VIRTUAL_ENV='{quoted_venv}'
+        ;;
+esac
+
+_OLD_VIRTUAL_PATH="$PATH"
+PATH="$VIRTUAL_ENV/"Scripts":$PATH"
+export PATH
+VIRTUAL_ENV_PROMPT=venv
+export VIRTUAL_ENV_PROMPT
+if [ -n "${{PYTHONHOME:-}}" ] ; then
+    _OLD_VIRTUAL_PYTHONHOME="${{PYTHONHOME:-}}"
+    unset PYTHONHOME
+fi
+if [ -z "${{VIRTUAL_ENV_DISABLE_PROMPT:-}}" ] ; then
+    _OLD_VIRTUAL_PS1="${{PS1:-}}"
+    PS1="("venv") ${{PS1:-}}"
+    export PS1
+fi
+hash -r 2> /dev/null
+""",
+        encoding="utf-8",
+    )
+
+    command = f'''
+source "{activate}"
+command -v python
+command -V deactivate
+deactivate
+printf 'after:%s:%s:%s:%s\\n' "$?" "${{VIRTUAL_ENV:-gone}}" "${{VIRTUAL_ENV_PROMPT:-gone}}" "${{PYTHONHOME:-gone}}"
+printf 'ps1:%s\\n' "$PS1"
+command -v deactivate || echo deactivate-gone
+'''
+    status, stdout, stderr, _shell = run_shell(
+        command,
+        env={"PATH": "", "PATHEXT": ".EXE;.BAT;.CMD", "PS1": "$ ", "PYTHONHOME": "oldhome"},
+    )
+    lines = stdout.splitlines()
+
+    assert status == 0
+    assert os.path.normcase(lines[0]) == os.path.normcase(str(fake_python))
+    assert lines[1] == "deactivate is a shell function"
+    assert lines[2] == "after:0:gone:gone:oldhome"
+    assert lines[3] == "ps1:$ "
+    assert lines[4] == "deactivate-gone"
+    assert stderr == ""
+
+
+def test_windows_cygpath_fallback_converts_basic_paths():
+    if os.name != "nt":
+        return
+
+    status, stdout, stderr, _shell = run_shell(
+        r"cygpath 'C:\Users\neko\venv'; cygpath -w /c/Users/neko/venv; cygpath -m 'C:\Users\neko\venv'",
+        env={"PATH": ""},
+    )
+    lines = stdout.splitlines()
+
+    assert status == 0
+    assert lines[0] == "/c/Users/neko/venv"
+    assert os.path.normcase(lines[1]) == os.path.normcase(r"C:\Users\neko\venv")
+    assert lines[2] == "C:/Users/neko/venv"
     assert stderr == ""
 
 
@@ -325,6 +476,49 @@ dirname "{moved}"
     assert stderr == ""
 
 
+def test_cat_decodes_gbk_file_when_stdout_is_tty(tmp_path):
+    text = chr(0x4F60) + chr(0x597D) + "\n"
+    path = tmp_path / "gbk.txt"
+    path.write_bytes(text.encode("gbk"))
+    stdout = TtyStringIO()
+    stderr = io.StringIO()
+    shell = Shell(stdout=stdout, stderr=stderr, env={"PATH": ""})
+
+    status = shell.execute(f'cat "{path}"')
+
+    assert status == 0
+    assert stdout.getvalue() == text
+    assert stderr.getvalue() == ""
+
+
+def test_cat_preserves_bytes_when_piped_or_redirected(tmp_path):
+    text = chr(0x4F60) + chr(0x597D) + "\n"
+    data = text.encode("gbk")
+    source = tmp_path / "gbk.txt"
+    copy = tmp_path / "copy.txt"
+    source.write_bytes(data)
+
+    status, stdout, stderr, _shell = run_shell(
+        f'cat "{source}" | wc -c\ncat "{source}" > "{copy}"',
+        env={"PATH": ""},
+    )
+
+    assert status == 0
+    assert stdout == f"{len(data)}\n"
+    assert copy.read_bytes() == data
+    assert stderr == ""
+
+
+def test_text_pipeline_still_uses_utf8_bytes_for_binary_readers():
+    text = chr(0x4E2D) + chr(0x6587)
+
+    status, stdout, stderr, _shell = run_shell(f'echo "{text}" | wc -c', env={"PATH": ""})
+
+    assert status == 0
+    assert stdout == f"{len((text + chr(10)).encode('utf-8'))}\n"
+    assert stderr == ""
+
+
 def test_internal_process_and_identity_utilities_without_path():
     command = "ps; uname -s; whoami; id; date +%Y" if os.name == "nt" else "uname -s; whoami; id; date +%Y"
     status, stdout, stderr, _shell = run_shell(
@@ -439,7 +633,7 @@ def test_top_fallback_batch_snapshot(monkeypatch):
             state="S",
         ),
     ]
-    monkeypatch.setattr(posix_utils, "collect_top_processes", lambda: fake_processes)
+    monkeypatch.setattr(posix_utils, "collect_top_processes", lambda *, detailed=True: fake_processes)
     monkeypatch.setattr(
         posix_utils,
         "memory_snapshot",
@@ -456,6 +650,68 @@ def test_top_fallback_batch_snapshot(monkeypatch):
     assert "python app.py" in stdout
     assert "service" in stdout
     assert stderr == ""
+
+
+def test_top_interactive_shows_loading_before_snapshot(monkeypatch):
+    stdin = TtyStringIO()
+    stdout = TtyStringIO()
+    stderr = io.StringIO()
+
+    def fake_render(options, *, interactive):
+        del options
+        assert interactive is True
+        assert "top - collecting process snapshot..." in stdout.getvalue()
+        return "top - ready\nPID USER COMMAND\n"
+
+    monkeypatch.setattr(posix_utils, "render_top_snapshot", fake_render)
+    monkeypatch.setattr(posix_utils, "wait_for_top_quit", lambda _stdin, _delay: False)
+
+    status = posix_utils.utility_top(None, ["top", "-n", "1"], stdin, stdout, stderr)
+
+    output = stdout.getvalue()
+    assert status == 0
+    assert "top - collecting process snapshot..." in output
+    assert "top - ready" in output
+    assert "\033[?1049h" not in output
+    assert "\033[?1049l" not in output
+    assert stderr.getvalue() == ""
+
+
+def test_top_windows_uses_fast_process_snapshot(monkeypatch):
+    now = dt.datetime.now()
+    fake_processes = [
+        ProcessInfo(
+            pid=42,
+            ppid=1,
+            user="neko",
+            tty="?",
+            cpu_seconds=12,
+            start_time=now,
+            cmd="python app.py",
+            name="python",
+            rss=64 * 1024 * 1024,
+            virtual_size=128 * 1024 * 1024,
+            state="R",
+        )
+    ]
+    detailed_flags = []
+
+    monkeypatch.setattr(posix_utils.os, "name", "nt")
+    monkeypatch.setattr(posix_utils, "collect_top_processes", lambda *, detailed=True: detailed_flags.append(detailed) or fake_processes)
+    monkeypatch.setattr(
+        posix_utils,
+        "memory_snapshot",
+        lambda: {"total": 256 * 1024 * 1024, "free": 128 * 1024 * 1024, "used": 96 * 1024 * 1024, "cached": 32 * 1024 * 1024, "swap_total": 0, "swap_free": 0},
+    )
+
+    interactive_snapshot = posix_utils.render_top_snapshot(posix_utils.TopOptions(), interactive=True)
+    batch_snapshot = posix_utils.render_top_snapshot(posix_utils.TopOptions(), interactive=False)
+
+    assert detailed_flags == [False, False]
+    assert "python app.py" in interactive_snapshot
+    assert "python app.py" in batch_snapshot
+    assert "Press q to quit." in interactive_snapshot
+    assert "Press q to quit." not in batch_snapshot
 
 
 def test_ps_internal_fallback_is_windows_only(monkeypatch):
@@ -500,6 +756,35 @@ def test_windows_which_reports_executables_builtins_and_internal_utilities(tmp_p
         os.path.normcase(str(first_tool)),
         os.path.normcase(str(second_tool)),
     ]
+    assert stderr == ""
+
+
+def test_windows_batch_files_run_from_current_directory(tmp_path):
+    if os.name != "nt":
+        return
+
+    script = tmp_path / "runme.bat"
+    script.write_bytes(b"@echo off\r\necho bat:%1\r\nexit /b 7\r\n")
+    old_cwd = os.getcwd()
+    try:
+        os.chdir(tmp_path)
+        status, stdout, stderr, _shell = run_shell(
+            r"""
+.\runme.bat backslash
+echo status:$?
+./runme.bat slash
+echo status:$?
+runme.bat bare
+echo status:$?
+""",
+            env={"PATH": "", "PATHEXT": ".EXE;.BAT;.CMD"},
+            stdin=io.StringIO(""),
+        )
+    finally:
+        os.chdir(old_cwd)
+
+    assert status == 0
+    assert stdout == "bat:backslash\nstatus:7\nbat:slash\nstatus:7\nbat:bare\nstatus:7\n"
     assert stderr == ""
 
 

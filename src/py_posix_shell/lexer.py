@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import Iterable
 
@@ -89,6 +90,9 @@ def lex(source: str) -> list[Token]:
 
     def last_token_is_separator() -> bool:
         return bool(tokens and isinstance(tokens[-1], Operator) and tokens[-1].value == ";")
+
+    def current_word_text() -> str:
+        return "".join(part.text for part in parts)
 
     while i < len(source):
         char = source[i]
@@ -194,6 +198,10 @@ def lex(source: str) -> list[Token]:
             continue
 
         if char == "\\":
+            if should_keep_windows_path_separator(source, i, current_word_text()):
+                add_part("\\", PLAIN)
+                i += 1
+                continue
             if i + 1 < len(source) and source[i + 1] == "\n":
                 i += 2
                 continue
@@ -232,6 +240,19 @@ def lex(source: str) -> list[Token]:
     while tokens and isinstance(tokens[-1], Operator) and tokens[-1].value == ";":
         tokens.pop()
     return tokens
+
+
+def should_keep_windows_path_separator(source: str, index: int, word_text: str) -> bool:
+    if os.name != "nt" or index + 1 >= len(source):
+        return False
+    next_char = source[index + 1]
+    if next_char.isspace() or next_char in ";|&<>()":
+        return False
+    if word_text in {".", ".."}:
+        return True
+    if len(word_text) == 2 and word_text[0].isalpha() and word_text[1] == ":":
+        return True
+    return "\\" in word_text
 
 
 def dump_tokens(tokens: Iterable[Token]) -> list[str]:

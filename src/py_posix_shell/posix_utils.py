@@ -83,13 +83,25 @@ class TopOptions:
 def utility_cat(shell, argv: list[str], stdin: TextIO, stdout: TextIO, stderr: TextIO) -> int:
     status = 0
     paths = [arg for arg in argv[1:] if arg != "--"] or ["-"]
+    tty_output = stream_is_tty(stdout)
     for path in paths:
         try:
             if path == "-":
-                stdout.write(stdin.read())
+                data = read_stdin_bytes(stdin)
+                if tty_output:
+                    stdout.write(decode_cat_display_bytes(data))
+                elif stream_accepts_binary_output(stdout):
+                    write_binary_output(stdout, data)
+                else:
+                    stdout.write(decode_cat_display_bytes(data))
             else:
-                with open(path, "r", encoding="utf-8", errors="replace") as file:
-                    shutil.copyfileobj(file, stdout)
+                data = Path(path).read_bytes()
+                if tty_output:
+                    stdout.write(decode_cat_display_bytes(data))
+                elif stream_accepts_binary_output(stdout):
+                    write_binary_output(stdout, data)
+                else:
+                    stdout.write(decode_cat_display_bytes(data))
         except OSError as exc:
             stderr.write(f"cat: {path}: {exc.strerror or exc}\n")
             status = 1
@@ -1075,7 +1087,9 @@ def utility_which(shell, argv: list[str], stdin: TextIO, stdout: TextIO, stderr:
             status = 1
             continue
         for kind, value in (matches if show_all else matches[:1]):
-            if kind == "builtin":
+            if kind == "function":
+                stdout.write(f"{value}: shell function\n")
+            elif kind == "builtin":
                 stdout.write(f"{value}: shell built-in command\n")
             elif kind == "utility":
                 stdout.write(f"{value}: shell utility\n")
@@ -1098,6 +1112,8 @@ def utility_top(shell, argv: list[str], stdin: TextIO, stdout: TextIO, stderr: T
     count = 0
     if interactive:
         enter_top_screen(stdout)
+        stdout.write("top - collecting process snapshot...\nPress q to quit. Refresh interval: %.1fs\n" % options.delay)
+        stdout.flush()
     try:
         while iterations is None or count < iterations:
             text = render_top_snapshot(options, interactive=interactive)
@@ -1427,6 +1443,47 @@ def utility_uname(shell, argv: list[str], stdin: TextIO, stdout: TextIO, stderr:
                 stderr.write(f"uname: invalid option: {arg}\n")
                 return 2
     stdout.write(" ".join(values) + "\n")
+    return 0
+
+
+def utility_cygpath(shell, argv: list[str], stdin: TextIO, stdout: TextIO, stderr: TextIO) -> int:
+    mode = "unix"
+    absolute = False
+    paths: list[str] = []
+    index = 1
+    while index < len(argv):
+        arg = argv[index]
+        if arg == "--":
+            paths.extend(argv[index + 1 :])
+            break
+        if arg in {"-u", "--unix"}:
+            mode = "unix"
+        elif arg in {"-w", "--windows"}:
+            mode = "windows"
+        elif arg in {"-m", "--mixed"}:
+            mode = "mixed"
+        elif arg in {"-a", "--absolute"}:
+            absolute = True
+        elif arg.startswith("-"):
+            stderr.write(f"cygpath: invalid option: {arg}\n")
+            return 2
+        else:
+            paths.append(arg)
+        index += 1
+
+    if not paths:
+        stderr.write("cygpath: missing operand\n")
+        return 2
+
+    for path in paths:
+        if absolute:
+            path = os.path.abspath(normalize_path_entry(path))
+        if mode == "unix":
+            stdout.write(path_to_msys_path(path) + "\n")
+        elif mode == "mixed":
+            stdout.write(normalize_path_entry(path).replace("\\", "/") + "\n")
+        else:
+            stdout.write(normalize_path_entry(path) + "\n")
     return 0
 
 
@@ -2427,13 +2484,20 @@ def parse_csv_line(line: str) -> list[str]:
 def read_binary_inputs(paths: Iterable[str], stdin: TextIO) -> Iterable[bytes]:
     for path in paths:
         if path == "-":
-            buffer = getattr(stdin, "buffer", None)
-            if buffer is not None:
-                yield buffer.read()
-            else:
-                yield stdin.read().encode("utf-8")
+            yield read_stdin_bytes(stdin)
             continue
         yield Path(path).read_bytes()
+
+
+def read_stdin_bytes(stdin: TextIO) -> bytes:
+    buffer = getattr(stdin, "buffer", None)
+    if buffer is not None:
+        return buffer.read()
+    return text_to_pipeline_bytes(stdin.read())
+
+
+def text_to_pipeline_bytes(text: str) -> bytes:
+    return text.encode("utf-8")
 
 
 def write_binary_output(stdout: TextIO, data: bytes) -> None:
@@ -2443,6 +2507,23 @@ def write_binary_output(stdout: TextIO, data: bytes) -> None:
         buffer.flush()
     else:
         stdout.write(data.decode("latin-1"))
+
+
+def stream_accepts_binary_output(stdout: TextIO) -> bool:
+    return getattr(stdout, "buffer", None) is not None
+
+
+def decode_cat_display_bytes(data: bytes) -> str:
+    for encoding in ("utf-8-sig", "gbk"):
+        try:
+            return normalize_text_newlines(data.decode(encoding))
+        except UnicodeDecodeError:
+            continue
+    return normalize_text_newlines(data.decode("utf-8", errors="replace"))
+
+
+def normalize_text_newlines(text: str) -> str:
+    return text.replace("\r\n", "\n").replace("\r", "\n")
 
 
 def stream_is_tty(stream: TextIO) -> bool:
@@ -3441,7 +3522,7 @@ def normalize_top_sort_key(value: str) -> str:
 
 
 def render_top_snapshot(options: TopOptions, *, interactive: bool) -> str:
-    processes = collect_top_processes()
+    processes = collect_top_processes(detailed=os.name != "nt")
     processes = filter_top_processes(processes, options)
     processes = sort_top_processes(processes, options.sort_key)
     columns, rows = shutil.get_terminal_size((100, 30))
@@ -3455,9 +3536,9 @@ def render_top_snapshot(options: TopOptions, *, interactive: bool) -> str:
     return "\n".join(line[:columns] for line in lines) + "\n"
 
 
-def collect_top_processes() -> list[ProcessInfo]:
+def collect_top_processes(*, detailed: bool = True) -> list[ProcessInfo]:
     if os.name == "nt":
-        return collect_windows_processes(detailed=True) or collect_windows_processes(detailed=False) or [current_process_info()]
+        return collect_windows_processes(detailed=detailed) or [current_process_info()]
     return collect_procfs_processes() or collect_ps_processes() or [current_process_info()]
 
 
@@ -3584,12 +3665,12 @@ def truncate_top_user(user: str, width: int) -> str:
 
 
 def enter_top_screen(stdout: TextIO) -> None:
-    stdout.write("\033[?1049h\033[?25l\033[H\033[2J")
+    stdout.write("\033[?25l\033[H\033[2J")
     stdout.flush()
 
 
 def leave_top_screen(stdout: TextIO) -> None:
-    stdout.write("\033[?25h\033[?1049l")
+    stdout.write("\033[?25h")
     stdout.flush()
 
 
@@ -4257,7 +4338,9 @@ def which_command_matches(shell, name: str) -> list[tuple[str, str]]:
     matches: list[tuple[str, str]] = []
     if not name:
         return matches
-    if shell.is_builtin(name):
+    if name in shell.functions:
+        matches.append(("function", name))
+    elif shell.is_builtin(name):
         matches.append(("builtin", name))
     elif shell.should_run_internal_utility(name, shell.env):
         matches.append(("utility", name))
@@ -4279,8 +4362,8 @@ def find_executable_matches(name: str, env: dict[str, str]) -> list[str]:
 
     matches: list[str] = []
     path_text = env.get("PATH", os.environ.get("PATH", ""))
-    for directory in path_text.split(os.pathsep):
-        search_dir = directory or "."
+    for directory in split_path_list(path_text):
+        search_dir = normalize_path_entry(directory or ".")
         for candidate in executable_name_candidates(name, env):
             path = os.path.join(search_dir, candidate)
             if is_executable_file(path):
@@ -4289,6 +4372,7 @@ def find_executable_matches(name: str, env: dict[str, str]) -> list[str]:
 
 
 def executable_path_candidates(path: str, env: dict[str, str]) -> list[str]:
+    path = normalize_path_entry(path)
     root, ext = os.path.splitext(path)
     if ext or os.name != "nt":
         return [path]
@@ -4306,6 +4390,53 @@ def windows_pathext(env: dict[str, str]) -> list[str]:
     value = env.get("PATHEXT", os.environ.get("PATHEXT", ".COM;.EXE;.BAT;.CMD"))
     suffixes = [suffix if suffix.startswith(".") else "." + suffix for suffix in value.split(";") if suffix]
     return suffixes or [".COM", ".EXE", ".BAT", ".CMD"]
+
+
+def split_path_list(path_text: str) -> list[str]:
+    if os.name != "nt":
+        return path_text.split(os.pathsep)
+    entries: list[str] = []
+    start = 0
+    index = 0
+    while index < len(path_text):
+        char = path_text[index]
+        if char == ";" or (char == ":" and not is_windows_drive_colon(path_text, index, start)):
+            entries.append(path_text[start:index])
+            start = index + 1
+        index += 1
+    entries.append(path_text[start:])
+    return entries
+
+
+def is_windows_drive_colon(value: str, index: int, segment_start: int) -> bool:
+    return index == segment_start + 1 and value[segment_start:index].isalpha()
+
+
+def normalize_path_entry(path: str) -> str:
+    if os.name != "nt":
+        return path
+    match = re.match(r"^/cygdrive/([A-Za-z])(?:/(.*))?$", path)
+    if match:
+        drive, rest = match.groups()
+        return drive.upper() + ":\\" + ((rest or "").replace("/", "\\"))
+    match = re.match(r"^/([A-Za-z])(?:/(.*))?$", path)
+    if match:
+        drive, rest = match.groups()
+        return drive.upper() + ":\\" + ((rest or "").replace("/", "\\"))
+    return path
+
+
+def path_to_msys_path(path: str) -> str:
+    if os.name != "nt":
+        return path.replace("\\", "/")
+    native = normalize_path_entry(path)
+    drive, tail = os.path.splitdrive(native)
+    if not drive:
+        return native.replace("\\", "/")
+    rest = tail.replace("\\", "/")
+    if not rest.startswith("/"):
+        rest = "/" + rest
+    return "/" + drive[:1].lower() + rest
 
 
 def is_executable_file(path: str) -> bool:
@@ -4780,6 +4911,7 @@ HELP_ITEMS: tuple[tuple[str, str, str], ...] = (
     ("cat", "cat [file ...]", "Concatenate files to standard output."),
     ("cp", "cp [-Rfp] source ... target", "Copy files and directories."),
     ("cut", "cut -b|-c|-f list [file ...]", "Select byte, character, or field ranges."),
+    ("cygpath", "cygpath [-u|-w|-m] [-a] path ...", "Convert between Windows and MSYS/Cygwin-style paths."),
     ("date", "date [+format]", "Display the current date and time."),
     ("df", "df [-hkmPT] [file ...]", "Report filesystem disk space usage."),
     ("diff", "diff [-u] file1 file2", "Compare files line by line."),
@@ -4841,6 +4973,7 @@ INTERNAL_UTILITIES: dict[str, Utility] = {
     "cmp": utility_cmp,
     "cp": utility_cp,
     "cut": utility_cut,
+    "cygpath": utility_cygpath,
     "date": utility_date,
     "df": utility_df,
     "diff": utility_diff,

@@ -358,13 +358,32 @@ def builtin_export(shell, argv: list[str], stdin: TextIO, stdout: TextIO, stderr
 
 
 def builtin_unset(shell, argv: list[str], stdin: TextIO, stdout: TextIO, stderr: TextIO) -> int:
+    mode = "variable"
+    items: list[tuple[str, str]] = []
+    for arg in argv[1:]:
+        if arg == "--":
+            continue
+        if arg == "-f":
+            mode = "function"
+            continue
+        if arg == "-v":
+            mode = "variable"
+            continue
+        if arg.startswith("-"):
+            stderr.write(f"unset: invalid option: {arg}\n")
+            return 2
+        items.append((mode, arg))
+
     status = 0
-    for name in argv[1:]:
+    for mode, name in items:
         if not is_name(name):
             stderr.write(f"unset: {name}: not a valid identifier\n")
             status = 1
             continue
-        shell.unset_parameter(name)
+        if mode == "function":
+            shell.functions.pop(name, None)
+        else:
+            shell.unset_parameter(name)
     return status
 
 
@@ -617,6 +636,9 @@ def builtin_type(shell, argv: list[str], stdin: TextIO, stdout: TextIO, stderr: 
         return 2
     status = 0
     for name in argv[1:]:
+        if name in shell.functions:
+            stdout.write(f"{name} is a shell function\n")
+            continue
         if shell.is_builtin(name):
             stdout.write(f"{name} is a shell builtin\n")
             continue
@@ -639,6 +661,9 @@ def builtin_command(shell, argv: list[str], stdin: TextIO, stdout: TextIO, stder
     if args[0] in {"-v", "-V"}:
         status = 0
         for name in args[1:]:
+            if name in shell.functions:
+                stdout.write(f"{name}\n" if args[0] == "-v" else f"{name} is a shell function\n")
+                continue
             if shell.is_builtin(name):
                 stdout.write(f"{name}\n" if args[0] == "-v" else f"{name} is a shell builtin\n")
                 continue
