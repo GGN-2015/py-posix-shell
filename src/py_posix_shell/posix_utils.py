@@ -1022,6 +1022,56 @@ def utility_ps(shell, argv: list[str], stdin: TextIO, stdout: TextIO, stderr: Te
     return 0
 
 
+def utility_which(shell, argv: list[str], stdin: TextIO, stdout: TextIO, stderr: TextIO) -> int:
+    del stdin
+    if os.name != "nt":
+        stderr.write("which: fallback implementation is only available on Windows\n")
+        return 127
+
+    show_all = False
+    names: list[str] = []
+    index = 1
+    while index < len(argv):
+        arg = argv[index]
+        if arg == "--":
+            names.extend(argv[index + 1 :])
+            break
+        if arg in {"-a", "--all"}:
+            show_all = True
+        elif arg == "--help":
+            stdout.write("Usage: which [-a] name ...\n")
+            return 0
+        elif arg.startswith("-") and arg != "-":
+            for flag in arg[1:]:
+                if flag == "a":
+                    show_all = True
+                else:
+                    stderr.write(f"which: invalid option -- {flag}\n")
+                    return 2
+        else:
+            names.append(arg)
+        index += 1
+
+    if not names:
+        stderr.write("which: missing operand\n")
+        return 2
+
+    status = 0
+    for name in names:
+        matches = which_command_matches(shell, name)
+        if not matches:
+            status = 1
+            continue
+        for kind, value in (matches if show_all else matches[:1]):
+            if kind == "builtin":
+                stdout.write(f"{value}: shell built-in command\n")
+            elif kind == "utility":
+                stdout.write(f"{value}: shell utility\n")
+            else:
+                stdout.write(value + "\n")
+    return status
+
+
 def utility_sleep(shell, argv: list[str], stdin: TextIO, stdout: TextIO, stderr: TextIO) -> int:
     if len(argv) < 2:
         stderr.write("sleep: missing operand\n")
@@ -3607,6 +3657,69 @@ def windows_total_physical_memory() -> int:
     return int(status.ullTotalPhys)
 
 
+def which_command_matches(shell, name: str) -> list[tuple[str, str]]:
+    matches: list[tuple[str, str]] = []
+    if not name:
+        return matches
+    if shell.is_builtin(name):
+        matches.append(("builtin", name))
+    elif shell.should_run_internal_utility(name, shell.env):
+        matches.append(("utility", name))
+
+    seen_paths: set[str] = set()
+    resolved = shell.resolve_command(name, shell.env)
+    for path in ([resolved] if resolved else []) + find_executable_matches(name, shell.env):
+        key = os.path.normcase(os.path.abspath(path))
+        if key in seen_paths:
+            continue
+        seen_paths.add(key)
+        matches.append(("path", path))
+    return matches
+
+
+def find_executable_matches(name: str, env: dict[str, str]) -> list[str]:
+    if any(sep in name for sep in ("/", "\\")):
+        return [path for path in executable_path_candidates(name, env) if is_executable_file(path)]
+
+    matches: list[str] = []
+    path_text = env.get("PATH", os.environ.get("PATH", ""))
+    for directory in path_text.split(os.pathsep):
+        search_dir = directory or "."
+        for candidate in executable_name_candidates(name, env):
+            path = os.path.join(search_dir, candidate)
+            if is_executable_file(path):
+                matches.append(os.path.abspath(path))
+    return matches
+
+
+def executable_path_candidates(path: str, env: dict[str, str]) -> list[str]:
+    root, ext = os.path.splitext(path)
+    if ext or os.name != "nt":
+        return [path]
+    return [root + suffix for suffix in windows_pathext(env)]
+
+
+def executable_name_candidates(name: str, env: dict[str, str]) -> list[str]:
+    root, ext = os.path.splitext(name)
+    if ext or os.name != "nt":
+        return [name]
+    return [name + suffix for suffix in windows_pathext(env)]
+
+
+def windows_pathext(env: dict[str, str]) -> list[str]:
+    value = env.get("PATHEXT", os.environ.get("PATHEXT", ".COM;.EXE;.BAT;.CMD"))
+    suffixes = [suffix if suffix.startswith(".") else "." + suffix for suffix in value.split(";") if suffix]
+    return suffixes or [".COM", ".EXE", ".BAT", ".CMD"]
+
+
+def is_executable_file(path: str) -> bool:
+    if not os.path.isfile(path):
+        return False
+    if os.name == "nt":
+        return True
+    return os.access(path, os.X_OK)
+
+
 LSBLK_COLUMN_NAMES = {
     "NAME",
     "KNAME",
@@ -4089,6 +4202,7 @@ HELP_ITEMS: tuple[tuple[str, str, str], ...] = (
     ("tr", "tr [-d] set1 [set2]", "Translate or delete characters."),
     ("vi", "vi [file]", "Edit a file with the Windows-only full-screen TTY fallback when vi/vim is missing."),
     ("wc", "wc [-lwc] [file ...]", "Count lines, words, and bytes."),
+    ("which", "which [-a] name ...", "Locate commands, builtins, and Windows executable files."),
     ("xargs", "xargs [-0] [-n count] [-I repl] [command ...]", "Build command lines from standard input."),
 )
 
@@ -4171,6 +4285,7 @@ INTERNAL_UTILITIES: dict[str, Utility] = {
     "updatedb": utility_updatedb,
     "vi": utility_vi,
     "wc": utility_wc,
+    "which": utility_which,
     "whoami": utility_whoami,
     "xargs": utility_xargs,
     "yes": utility_yes,

@@ -424,6 +424,36 @@ def test_command_and_type_report_internal_utility_when_path_is_empty():
     assert stderr == ""
 
 
+def test_windows_which_reports_executables_builtins_and_internal_utilities(tmp_path):
+    if os.name != "nt":
+        return
+    first_bin = tmp_path / "first"
+    second_bin = tmp_path / "second"
+    first_bin.mkdir()
+    second_bin.mkdir()
+    first_tool = first_bin / "tool.exe"
+    second_tool = second_bin / "tool.exe"
+    first_tool.write_text("", encoding="utf-8")
+    second_tool.write_text("", encoding="utf-8")
+
+    status, stdout, stderr, _shell = run_shell(
+        "which tool; which cd; which ls; which missing; echo status:$?; which -a tool",
+        env={"PATH": f"{first_bin};{second_bin}", "PATHEXT": ".EXE;.CMD"},
+    )
+
+    lines = stdout.splitlines()
+    assert status == 0
+    assert os.path.normcase(lines[0]) == os.path.normcase(str(first_tool))
+    assert lines[1] == "cd: shell built-in command"
+    assert lines[2] == "ls: shell utility"
+    assert lines[3] == "status:1"
+    assert [os.path.normcase(line) for line in lines[4:]] == [
+        os.path.normcase(str(first_tool)),
+        os.path.normcase(str(second_tool)),
+    ]
+    assert stderr == ""
+
+
 def test_external_keyboard_interrupt_returns_130(monkeypatch):
     shell = Shell(stdin=io.StringIO(), stdout=io.StringIO(), stderr=io.StringIO())
     shell.resolve_command = lambda _name, _env: "fake-more"  # type: ignore[method-assign]
@@ -841,6 +871,7 @@ def test_internal_help_utility_without_path():
     assert "help [name ...]" in stdout
     assert "history [-c] [-d offset] [n]" in stdout
     assert "ps [aux|-ef]" in stdout
+    assert "which [-a] name ..." in stdout
     assert "cd [dir]\n    Change the current directory." in stdout
     assert "clear\n    Clear the terminal using an ANSI fallback sequence." in stdout
     assert "status:1\n" in stdout
