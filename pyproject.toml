@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "py-posix-shell"
-version = "0.4.23"
+version = "0.4.24"
 description = "A cross-platform POSIX-style shell written in Python."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -33,6 +33,7 @@ dev = ["pytest>=8"]
 [project.scripts]
 pysh = "py_posix_shell.cli:main"
 py-posix-shell = "py_posix_shell.cli:main"
+cygpath = "py_posix_shell.cli:cygpath_main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/py_posix_shell"]

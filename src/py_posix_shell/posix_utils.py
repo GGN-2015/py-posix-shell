@@ -1449,6 +1449,7 @@ def utility_uname(shell, argv: list[str], stdin: TextIO, stdout: TextIO, stderr:
 def utility_cygpath(shell, argv: list[str], stdin: TextIO, stdout: TextIO, stderr: TextIO) -> int:
     mode = "unix"
     absolute = False
+    path_list = False
     paths: list[str] = []
     index = 1
     while index < len(argv):
@@ -1464,6 +1465,8 @@ def utility_cygpath(shell, argv: list[str], stdin: TextIO, stdout: TextIO, stder
             mode = "mixed"
         elif arg in {"-a", "--absolute"}:
             absolute = True
+        elif arg in {"-p", "--path"}:
+            path_list = True
         elif arg.startswith("-"):
             stderr.write(f"cygpath: invalid option: {arg}\n")
             return 2
@@ -1476,15 +1479,32 @@ def utility_cygpath(shell, argv: list[str], stdin: TextIO, stdout: TextIO, stder
         return 2
 
     for path in paths:
-        if absolute:
-            path = os.path.abspath(normalize_path_entry(path))
-        if mode == "unix":
-            stdout.write(path_to_msys_path(path) + "\n")
-        elif mode == "mixed":
-            stdout.write(normalize_path_entry(path).replace("\\", "/") + "\n")
+        if path_list:
+            stdout.write(convert_cygpath_path_list(path, mode, absolute) + "\n")
         else:
-            stdout.write(normalize_path_entry(path) + "\n")
+            stdout.write(convert_cygpath_path(path, mode, absolute) + "\n")
     return 0
+
+
+def convert_cygpath_path(path: str, mode: str, absolute: bool = False) -> str:
+    if absolute:
+        path = os.path.abspath(normalize_path_entry(path))
+    if mode == "unix":
+        return path_to_msys_path(path)
+    if mode == "mixed":
+        return normalize_path_entry(path).replace("\\", "/")
+    return normalize_path_entry(path)
+
+
+def convert_cygpath_path_list(path_text: str, mode: str, absolute: bool = False) -> str:
+    if mode == "windows":
+        parts = path_text.split(":")
+        separator = ";"
+    else:
+        parts = split_path_list(path_text) if os.name == "nt" else path_text.split(os.pathsep)
+        separator = ":" if mode == "unix" else ";"
+    converted = [convert_cygpath_path(part, mode, absolute) for part in parts if part]
+    return separator.join(converted)
 
 
 def utility_whoami(shell, argv: list[str], stdin: TextIO, stdout: TextIO, stderr: TextIO) -> int:
@@ -5499,7 +5519,7 @@ HELP_ITEMS: tuple[tuple[str, str, str], ...] = (
     ("cat", "cat [file ...]", "Concatenate files to standard output."),
     ("cp", "cp [-Rfp] source ... target", "Copy files and directories."),
     ("cut", "cut -b|-c|-f list [file ...]", "Select byte, character, or field ranges."),
-    ("cygpath", "cygpath [-u|-w|-m] [-a] path ...", "Convert between Windows and MSYS/Cygwin-style paths."),
+    ("cygpath", "cygpath [-u|-w|-m] [-a] [--path] path ...", "Convert between Windows and MSYS/Cygwin-style paths."),
     ("date", "date [+format]", "Display the current date and time."),
     ("df", "df [-hkmPT] [file ...]", "Report filesystem disk space usage."),
     ("diff", "diff [-u] file1 file2", "Compare files line by line."),

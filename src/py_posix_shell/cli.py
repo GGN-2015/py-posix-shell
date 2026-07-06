@@ -7,6 +7,7 @@ import sys
 
 from . import __version__
 from .errors import ShellExit
+from .posix_utils import utility_cygpath
 from .shell import Shell
 
 
@@ -74,3 +75,8 @@ def main(argv: list[str] | None = None) -> int:
     except KeyboardInterrupt:
         print(file=sys.stderr)
         return 130
+
+
+def cygpath_main(argv: list[str] | None = None) -> int:
+    args = sys.argv[1:] if argv is None else argv
+    return utility_cygpath(None, ["cygpath", *args], sys.stdin, sys.stdout, sys.stderr)

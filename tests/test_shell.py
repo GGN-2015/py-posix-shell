@@ -565,6 +565,62 @@ def test_windows_cygpath_fallback_converts_basic_paths():
     assert stderr == ""
 
 
+def test_windows_cygpath_fallback_converts_path_lists():
+    if os.name != "nt":
+        return
+
+    status, stdout, stderr, _shell = run_shell(
+        r"cygpath --unix --path 'C:\Users\neko\venv;D:\tools'; cygpath --windows --path /c/Users/neko/venv:/d/tools",
+        env={"PATH": ""},
+    )
+    lines = stdout.splitlines()
+
+    assert status == 0
+    assert lines[0] == "/c/Users/neko/venv:/d/tools"
+    assert os.path.normcase(lines[1]) == os.path.normcase(r"C:\Users\neko\venv;D:\tools")
+    assert stderr == ""
+
+
+def test_windows_shell_adds_packaged_cygpath_to_child_path(tmp_path):
+    if os.name != "nt":
+        return
+
+    bindir = tmp_path / "Scripts"
+    bindir.mkdir()
+    pysh = bindir / "pysh.exe"
+    cygpath = bindir / "cygpath.exe"
+    pysh.write_text("", encoding="utf-8")
+    cygpath.write_text("", encoding="utf-8")
+
+    shell = Shell(env={"PATH": r"C:\base"}, shell_path=str(pysh))
+
+    path_entries = {os.path.normcase(entry) for entry in shell.env["PATH"].split(os.pathsep)}
+    assert os.path.normcase(str(bindir)) in path_entries
+
+
+def test_windows_conda_posix_environment_ignores_bash_without_cygpath(tmp_path):
+    if os.name != "nt":
+        return
+
+    bindir = tmp_path / "Scripts"
+    broken_bash_dir = tmp_path / "WindowsApps"
+    bindir.mkdir()
+    broken_bash_dir.mkdir()
+    pysh = bindir / "pysh.exe"
+    cygpath = bindir / "cygpath.exe"
+    conda = tmp_path / "conda.exe"
+    bash = broken_bash_dir / "bash.exe"
+    for path in (pysh, cygpath, conda, bash):
+        path.write_text("", encoding="utf-8")
+    shell = Shell(env={"PATH": str(broken_bash_dir)}, shell_path=str(pysh))
+
+    prepared = shell_module.prepare_external_environment(str(conda), [str(conda), "shell.posix", "activate", "base"], shell.env)
+    path_entries = {os.path.normcase(entry) for entry in prepared["PATH"].split(os.pathsep)}
+
+    assert os.path.normcase(str(bindir)) in path_entries
+    assert os.path.normcase(str(broken_bash_dir)) not in path_entries
+
+
 def test_group_subshell_negation_and_set_options(tmp_path):
     (tmp_path / "match.txt").write_text("", encoding="utf-8")
     old = os.getcwd()

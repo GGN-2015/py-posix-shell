@@ -38,7 +38,7 @@ from .parser import (
     SubshellCommand,
     parse,
 )
-from .posix_utils import INTERNAL_UTILITIES, executable_path_candidates, find_executable_matches, is_executable_file, normalize_path_entry
+from .posix_utils import INTERNAL_UTILITIES, executable_path_candidates, find_executable_matches, is_executable_file, normalize_path_entry, split_path_list
 
 
 @dataclass
@@ -169,6 +169,7 @@ class Shell:
                 self.env["HOME"] = home
         if not self.env.get("SHELL"):
             self.env["SHELL"] = resolve_shell_environment_value(shell_path or argv0, self.env)
+        ensure_cygpath_console_script_on_path(self.env)
 
     def clone(self, *, stdout: TextIO | None = None) -> "Shell":
         child = Shell(
@@ -842,6 +843,7 @@ class Shell:
         if executable is None:
             (stderr or self.stderr).write(f"{argv[0]}: command not found\n")
             return 127
+        env = prepare_external_environment(executable, argv, env)
 
         stdin = stdin if stdin is not None else self.stdin
         stdout = stdout if stdout is not None else self.stdout
@@ -1395,6 +1397,57 @@ def resolve_shell_environment_value(candidate: str, env: dict[str, str]) -> str:
     if found:
         return os.path.abspath(found)
     return candidate
+
+
+def ensure_cygpath_console_script_on_path(env: dict[str, str]) -> None:
+    if os.name != "nt":
+        return
+    shell_path = env.get("SHELL", "")
+    if not shell_path or not any(sep in shell_path for sep in ("/", "\\")):
+        return
+    shell_dir = os.path.dirname(os.path.abspath(normalize_path_entry(shell_path)))
+    if not shell_dir:
+        return
+    if not os.path.exists(os.path.join(shell_dir, "cygpath.exe")):
+        return
+    existing = {
+        os.path.normcase(os.path.abspath(normalize_path_entry(entry or ".")))
+        for entry in split_path_list(env.get("PATH", ""))
+    }
+    shell_dir_key = os.path.normcase(os.path.abspath(shell_dir))
+    if shell_dir_key in existing:
+        return
+    path_text = env.get("PATH", "")
+    env["PATH"] = f"{path_text}{os.pathsep if path_text else ''}{shell_dir}"
+
+
+def prepare_external_environment(executable: str, argv: list[str], env: dict[str, str]) -> dict[str, str]:
+    child_env = dict(env)
+    if is_conda_posix_shell_command(executable, argv):
+        ensure_cygpath_console_script_on_path(child_env)
+        child_env["PATH"] = remove_bash_without_cygpath_from_path(child_env.get("PATH", ""))
+    return child_env
+
+
+def is_conda_posix_shell_command(executable: str, argv: list[str]) -> bool:
+    if os.name != "nt" or len(argv) < 2:
+        return False
+    name = os.path.basename(executable).lower()
+    if name not in {"conda", "conda.exe", "conda.bat", "conda.cmd"}:
+        return False
+    return argv[1].startswith("shell.posix")
+
+
+def remove_bash_without_cygpath_from_path(path_text: str) -> str:
+    if os.name != "nt" or not path_text:
+        return path_text
+    kept: list[str] = []
+    for entry in split_path_list(path_text):
+        native = normalize_path_entry(entry or ".")
+        if os.path.exists(os.path.join(native, "bash.exe")) and not os.path.exists(os.path.join(native, "cygpath.exe")):
+            continue
+        kept.append(entry)
+    return os.pathsep.join(kept)
 
 
 def pipeline_input_stream(value: PipelineValue) -> TextIO:
