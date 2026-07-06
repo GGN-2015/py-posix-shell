@@ -8,6 +8,7 @@ import sys
 
 import py_posix_shell.posix_utils as posix_utils
 import py_posix_shell.shell as shell_module
+from py_posix_shell import cli
 from py_posix_shell.lexer import dump_tokens, lex
 from py_posix_shell.errors import ShellExit
 from py_posix_shell.posix_utils import ProcessInfo, StorageVolume, WindowsViEditor
@@ -50,6 +51,82 @@ def test_assignment_and_parameter_expansion():
     assert status == 0
     assert stdout == "hello-world\n"
     assert stderr == ""
+
+
+def test_shell_environment_variable_is_set_and_exported(tmp_path):
+    pysh_path = tmp_path / ("pysh.exe" if os.name == "nt" else "pysh")
+    shell = Shell(env={"PATH": ""}, argv0="script.sh", shell_path=str(pysh_path))
+
+    assert shell.get_parameter("0") == "script.sh"
+    assert os.path.normcase(shell.get_parameter("SHELL")) == os.path.normcase(os.path.abspath(pysh_path))
+    assert shell.env["SHELL"] == shell.get_parameter("SHELL")
+
+
+def test_shell_environment_variable_preserves_existing_value():
+    shell = Shell(env={"PATH": "", "SHELL": "/bin/custom"}, shell_path="/tmp/pysh")
+
+    assert shell.get_parameter("SHELL") == "/bin/custom"
+
+
+def test_cli_sets_shell_to_pysh_entry_when_running_script(monkeypatch, tmp_path, capsys):
+    script = tmp_path / "show-shell.pysh"
+    script.write_text('printf "%s\\n%s\\n" "$0" "$SHELL"\n', encoding="utf-8")
+    pysh_path = tmp_path / ("pysh.exe" if os.name == "nt" else "pysh")
+    monkeypatch.setattr(sys, "argv", [str(pysh_path), str(script)])
+
+    status = cli.main([str(script)])
+    captured = capsys.readouterr()
+
+    assert status == 0
+    assert captured.err == ""
+    lines = captured.out.splitlines()
+    assert lines[0] == str(script)
+    assert os.path.normcase(lines[1]) == os.path.normcase(os.path.abspath(pysh_path))
+
+
+def test_startup_file_sources_pyshrc_into_current_shell(tmp_path):
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / ".pyshrc").write_text("rc_value=loaded\nalias showrc='echo rc:$rc_value'\n", encoding="utf-8")
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    shell = Shell(env={"HOME": str(home), "PATH": ""}, stdout=stdout, stderr=stderr)
+
+    assert shell.source_startup_file() == 0
+    status = shell.execute("showrc")
+    assert status == 0
+    assert stdout.getvalue() == "rc:loaded\n"
+    assert stderr.getvalue() == ""
+
+
+def test_startup_file_missing_is_noop(tmp_path):
+    shell = Shell(env={"HOME": str(tmp_path), "PATH": ""}, stdout=io.StringIO(), stderr=io.StringIO())
+
+    assert shell.source_startup_file() == 0
+    assert shell.stdout.getvalue() == ""
+    assert shell.stderr.getvalue() == ""
+
+
+def test_cli_sources_pyshrc_before_interactive_repl(monkeypatch, tmp_path, capsys):
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / ".pyshrc").write_text("rc_value=from-rc\n", encoding="utf-8")
+    pysh_path = tmp_path / ("pysh.exe" if os.name == "nt" else "pysh")
+
+    def fake_repl(self):
+        self.stdout.write(self.get_parameter("rc_value") + "\n")
+        return 0
+
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(sys, "argv", [str(pysh_path)])
+    monkeypatch.setattr(shell_module.Shell, "repl", fake_repl)
+
+    status = cli.main(["-i"])
+    captured = capsys.readouterr()
+
+    assert status == 0
+    assert captured.out == "from-rc\n"
+    assert captured.err == ""
 
 
 def test_and_or_status():
@@ -152,6 +229,114 @@ echo "until:$i"
     assert stderr == ""
 
 
+def test_local_builtin_scopes_function_variables():
+    script = r"""
+value=global
+scratch=global-scratch
+f() {
+  local value=inner scratch=temp
+  echo "f:$value:$scratch"
+}
+f
+echo "after:$value:$scratch"
+
+blank=outer
+g() {
+  local blank
+  echo "blank:${blank-unset}:${blank:-fallback}"
+  blank=changed
+}
+g
+echo "blank-after:$blank"
+
+nested_outer() {
+  local value=outer
+  nested_inner() {
+    local value=inner
+    echo "nested:$value"
+  }
+  nested_inner
+  echo "outer:$value"
+}
+nested_outer
+echo "final:$value"
+"""
+    status, stdout, stderr, _shell = run_shell(script)
+
+    assert status == 0
+    assert stdout == (
+        "f:inner:temp\n"
+        "after:global:global-scratch\n"
+        "blank::fallback\n"
+        "blank-after:outer\n"
+        "nested:inner\n"
+        "outer:outer\n"
+        "final:global\n"
+    )
+    assert stderr == ""
+
+
+def test_local_builtin_requires_function_scope():
+    status, stdout, stderr, _shell = run_shell("local value=bad")
+
+    assert status == 1
+    assert stdout == ""
+    assert stderr == "local: can only be used in a function\n"
+
+
+def test_backslash_local_supports_conda_hook_style_functions():
+    script = r"""
+__conda_activate() {
+  \local ask_conda
+  ask_conda=hooked
+  echo "$ask_conda"
+}
+conda() {
+  \local cmd="${1-__missing__}"
+  case "$cmd" in
+    activate) __conda_activate "$@" ;;
+    *) echo "cmd:$cmd" ;;
+  esac
+}
+cmd=global
+conda activate
+echo "after:$cmd:${ask_conda-unset}"
+"""
+    status, stdout, stderr, _shell = run_shell(script)
+
+    assert status == 0
+    assert stdout == "hooked\nafter:global:unset\n"
+    assert stderr == ""
+
+
+def test_double_bracket_conditionals_support_shell_semantics(tmp_path):
+    sample = tmp_path / "sample.txt"
+    sample.write_text("data\n", encoding="utf-8")
+    script = f'''
+name=hello.txt
+empty=
+if [[ $name == *.txt && $name =~ ^hello[.] ]]; then echo pattern-regex; fi
+if [[ $name == "*.txt" ]]; then echo bad-literal; else echo literal-ok; fi
+if [[ ! ( 3 -lt 2 || -z "$name" ) ]]; then echo logic-ok; fi
+if [[ -n "$name" && "$name" != *.py && apple < banana ]]; then echo strings-ok; fi
+if [[ -f "{sample}" && -s "{sample}" ]]; then echo file-ok; fi
+if [[ $empty ]]; then echo bad-empty; else echo empty-ok; fi
+'''
+    status, stdout, stderr, _shell = run_shell(script, env={"PATH": ""})
+
+    assert status == 0
+    assert stdout == "pattern-regex\nliteral-ok\nlogic-ok\nstrings-ok\nfile-ok\nempty-ok\n"
+    assert stderr == ""
+
+
+def test_double_bracket_reports_syntax_errors():
+    status, stdout, stderr, _shell = run_shell("[[ a && ]]")
+
+    assert status == 2
+    assert stdout == ""
+    assert "[[:" in stderr
+
+
 def test_here_documents_and_parameter_operators():
     script = r"""
 name=world
@@ -170,6 +355,36 @@ echo "${#name}:${path##*/}:${path%/*}"
     assert stderr == ""
 
 
+def test_parameter_replacement_word_removes_syntax_quotes():
+    status, stdout, stderr, _shell = run_shell(r'PATH=old; echo "${PATH:+":${PATH}"}"', env={"PATH": ""})
+
+    assert status == 0
+    assert stdout == ":old\n"
+    assert stderr == ""
+
+
+def test_double_quoted_command_substitution_allows_nested_quotes():
+    status, stdout, stderr, _shell = run_shell(r'value="$(printf "%s" "$(printf inner)")"; echo "$value"', env={"PATH": ""})
+
+    assert status == 0
+    assert stdout == "inner\n"
+    assert stderr == ""
+
+
+def test_conda_style_path_expression_with_nested_command_substitution():
+    script = r'''
+CONDA_EXE=/c/ProgramData/miniforge3/Scripts/conda.exe
+PATH=base
+PATH="$(dirname "$(dirname "$CONDA_EXE")")/condabin${PATH:+":${PATH}"}"
+echo "$PATH"
+'''
+    status, stdout, stderr, _shell = run_shell(script, env={"PATH": ""})
+
+    assert status == 0
+    assert stdout == "/c/ProgramData/miniforge3/condabin:base\n"
+    assert stderr == ""
+
+
 def test_dot_eval_and_quoted_at(tmp_path):
     script_file = tmp_path / "lib.sh"
     script_file.write_text("from_dot=ok\nreturn 4\n", encoding="utf-8")
@@ -183,6 +398,32 @@ eval 'echo eval:$from_dot'
     status, stdout, stderr, _shell = run_shell(script)
     assert status == 0
     assert stdout == "ok:4\narg:a b\narg:c\neval:ok\n"
+    assert stderr == ""
+
+
+def test_source_accepts_windows_msys_and_cygdrive_paths(tmp_path):
+    if os.name != "nt":
+        return
+
+    script_file = tmp_path / "lib.sh"
+    script_file.write_text("from_msys=ok\n", encoding="utf-8")
+    drive, tail = os.path.splitdrive(str(script_file))
+    msys_path = "/" + drive[:1].lower() + tail.replace("\\", "/")
+    cygdrive_path = "/cygdrive/" + drive[:1].lower() + tail.replace("\\", "/")
+
+    status, stdout, stderr, _shell = run_shell(
+        f'''
+. "{msys_path}"
+echo "$from_msys"
+unset from_msys
+source "{cygdrive_path}"
+echo "$from_msys"
+''',
+        env={"PATH": ""},
+    )
+
+    assert status == 0
+    assert stdout == "ok\nok\n"
     assert stderr == ""
 
 

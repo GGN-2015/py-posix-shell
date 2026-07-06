@@ -169,6 +169,26 @@ def lex(source: str) -> list[Token]:
                 char = source[i]
                 if char == '"':
                     break
+                if char == "$" and source.startswith("$((", i):
+                    flush_double_chunk()
+                    value, i = read_arithmetic(source, i)
+                    add_part(value, DOUBLE)
+                    continue
+                if char == "$" and i + 1 < len(source) and source[i + 1] == "(":
+                    flush_double_chunk()
+                    value, i = read_balanced(source, i, "$(", ")")
+                    add_part(value, DOUBLE)
+                    continue
+                if char == "$" and i + 1 < len(source) and source[i + 1] == "{":
+                    flush_double_chunk()
+                    value, i = read_balanced(source, i, "${", "}")
+                    add_part(value, DOUBLE)
+                    continue
+                if char == "`":
+                    flush_double_chunk()
+                    value, i = read_backtick(source, i)
+                    add_part(value, DOUBLE)
+                    continue
                 if char == "\\":
                     if i + 1 >= len(source):
                         chunk.append("\\")

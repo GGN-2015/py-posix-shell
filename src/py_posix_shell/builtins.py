@@ -3,13 +3,17 @@
 from __future__ import annotations
 
 import os
+import fnmatch
+import re
 import signal
+import stat
 import sys
 import time
 from typing import Callable, TextIO
 
 from .errors import ShellBreak, ShellContinue, ShellExit, ShellReturn
 from .lexer import is_name
+from .posix_utils import normalize_path_entry
 
 Builtin = Callable[[object, list[str], TextIO, TextIO, TextIO], int]
 
@@ -95,6 +99,8 @@ def builtin_dot(shell, argv: list[str], stdin: TextIO, stdout: TextIO, stderr: T
         found = shell.which(path)
         if found:
             path = found
+    else:
+        path = normalize_path_entry(path)
     try:
         with open(path, "r", encoding="utf-8") as file:
             source = file.read()
@@ -354,6 +360,43 @@ def builtin_export(shell, argv: list[str], stdin: TextIO, stdout: TextIO, stderr
             status = 1
             continue
         shell.set_parameter(name, value, export=True)
+    return status
+
+
+def builtin_local(shell, argv: list[str], stdin: TextIO, stdout: TextIO, stderr: TextIO) -> int:
+    if not shell.in_function():
+        stderr.write("local: can only be used in a function\n")
+        return 1
+
+    export = False
+    operands: list[str] = []
+    parsing_options = True
+    for arg in argv[1:]:
+        if parsing_options and arg == "--":
+            parsing_options = False
+            continue
+        if parsing_options and arg.startswith("-") and arg != "-":
+            for flag in arg[1:]:
+                if flag == "x":
+                    export = True
+                else:
+                    stderr.write(f"local: invalid option: -{flag}\n")
+                    return 2
+            continue
+        parsing_options = False
+        operands.append(arg)
+
+    status = 0
+    for arg in operands:
+        if "=" in arg:
+            name, value = arg.split("=", 1)
+        else:
+            name, value = arg, None
+        if not is_name(name):
+            stderr.write(f"local: {arg}: not a valid identifier\n")
+            status = 1
+            continue
+        shell.declare_local_parameter(name, value, export=export)
     return status
 
 
@@ -697,12 +740,277 @@ def builtin_env(shell, argv: list[str], stdin: TextIO, stdout: TextIO, stderr: T
 
 def builtin_test(shell, argv: list[str], stdin: TextIO, stdout: TextIO, stderr: TextIO) -> int:
     args = argv[1:]
+    if argv[0] == "[[":
+        if not args or args[-1] != "]]":
+            stderr.write("[[: missing closing ]]\n")
+            return 2
+        try:
+            quoted = getattr(shell, "_conditional_quoted", ())
+            return 0 if eval_double_bracket(shell, args[:-1], quoted[1:-1]) else 1
+        except ValueError as exc:
+            stderr.write(f"[[: {exc}\n")
+            return 2
     if argv[0] == "[":
         if not args or args[-1] != "]":
             stderr.write("[: missing closing ]\n")
             return 2
         args = args[:-1]
     return 0 if eval_test(args) else 1
+
+
+class DoubleBracketParser:
+    def __init__(self, shell, tokens: list[str], quoted: tuple[bool, ...]):
+        self.shell = shell
+        self.tokens = tokens
+        self.quoted = quoted
+        self.pos = 0
+
+    def parse(self) -> bool:
+        if not self.tokens:
+            raise ValueError("conditional expression expected")
+        result = self.parse_or()
+        if not self.at_end():
+            raise ValueError(f"unexpected token: {self.peek()}")
+        return result
+
+    def parse_or(self) -> bool:
+        result = self.parse_and()
+        while self.consume_operator("||"):
+            right = self.parse_and()
+            result = result or right
+        return result
+
+    def parse_and(self) -> bool:
+        result = self.parse_not()
+        while self.consume_operator("&&"):
+            right = self.parse_not()
+            result = result and right
+        return result
+
+    def parse_not(self) -> bool:
+        if self.consume_operator("!"):
+            return not self.parse_not()
+        return self.parse_primary()
+
+    def parse_primary(self) -> bool:
+        if self.consume_operator("("):
+            result = self.parse_or()
+            if not self.consume_operator(")"):
+                raise ValueError("missing closing ')'")
+            return result
+        if self.peek_operator(")"):
+            raise ValueError("unexpected ')'")
+        return self.parse_test()
+
+    def parse_test(self) -> bool:
+        token = self.pop()
+        if is_double_bracket_unary_operator(token) and not self.was_quoted(self.pos - 1):
+            if self.at_end() or self.peek_operator(")") or self.peek_operator("&&") or self.peek_operator("||"):
+                raise ValueError(f"missing argument to {token}")
+            return eval_double_bracket_unary(self.shell, token, self.pop())
+
+        if self.at_end() or self.peek_operator(")") or self.peek_operator("&&") or self.peek_operator("||"):
+            return token != ""
+
+        operator_pos = self.pos
+        operator = self.pop()
+        if not is_double_bracket_binary_operator(operator) or self.was_quoted(operator_pos):
+            raise ValueError(f"unexpected token: {operator}")
+        if self.at_end() or self.peek_operator(")") or self.peek_operator("&&") or self.peek_operator("||"):
+            raise ValueError(f"missing right operand for {operator}")
+        right_pos = self.pos
+        right = self.pop()
+        return eval_double_bracket_binary(self.shell, token, operator, right, self.was_quoted(right_pos))
+
+    def pop(self) -> str:
+        if self.at_end():
+            raise ValueError("unexpected end of expression")
+        token = self.tokens[self.pos]
+        self.pos += 1
+        return token
+
+    def consume_operator(self, value: str) -> bool:
+        if self.peek_operator(value):
+            self.pos += 1
+            return True
+        return False
+
+    def peek_operator(self, value: str) -> bool:
+        return not self.at_end() and self.tokens[self.pos] == value and not self.was_quoted(self.pos)
+
+    def peek(self) -> str:
+        return self.tokens[self.pos] if not self.at_end() else ""
+
+    def was_quoted(self, index: int) -> bool:
+        return 0 <= index < len(self.quoted) and self.quoted[index]
+
+    def at_end(self) -> bool:
+        return self.pos >= len(self.tokens)
+
+
+def eval_double_bracket(shell, args: list[str], quoted: tuple[bool, ...]) -> bool:
+    return DoubleBracketParser(shell, args, quoted).parse()
+
+
+def is_double_bracket_unary_operator(value: str) -> bool:
+    return value in {
+        "-a",
+        "-b",
+        "-c",
+        "-d",
+        "-e",
+        "-f",
+        "-g",
+        "-h",
+        "-k",
+        "-L",
+        "-n",
+        "-N",
+        "-O",
+        "-G",
+        "-o",
+        "-p",
+        "-r",
+        "-s",
+        "-S",
+        "-t",
+        "-u",
+        "-v",
+        "-w",
+        "-x",
+        "-z",
+    }
+
+
+def is_double_bracket_binary_operator(value: str) -> bool:
+    return value in {"=", "==", "!=", "=~", "<", ">", "-eq", "-ne", "-gt", "-ge", "-lt", "-le", "-nt", "-ot", "-ef"}
+
+
+def eval_double_bracket_unary(shell, op: str, value: str) -> bool:
+    path = normalize_path_entry(value)
+    if op == "-n":
+        return value != ""
+    if op == "-z":
+        return value == ""
+    if op in {"-a", "-e"}:
+        return os.path.exists(path)
+    if op == "-b":
+        return file_mode_matches(path, stat.S_ISBLK)
+    if op == "-c":
+        return file_mode_matches(path, stat.S_ISCHR)
+    if op == "-d":
+        return os.path.isdir(path)
+    if op == "-f":
+        return os.path.isfile(path)
+    if op == "-g":
+        return bool(file_mode(path) & stat.S_ISGID)
+    if op in {"-h", "-L"}:
+        return os.path.islink(path)
+    if op == "-k":
+        return bool(file_mode(path) & stat.S_ISVTX)
+    if op == "-N":
+        return False
+    if op == "-O":
+        return hasattr(os, "getuid") and path_owner_id(path) == os.getuid()
+    if op == "-G":
+        return hasattr(os, "getgid") and path_group_id(path) == os.getgid()
+    if op == "-o":
+        return bool(getattr(shell, "options", {}).get(value, False))
+    if op == "-p":
+        return file_mode_matches(path, stat.S_ISFIFO)
+    if op == "-r":
+        return os.access(path, os.R_OK)
+    if op == "-s":
+        return os.path.exists(path) and os.path.getsize(path) > 0
+    if op == "-S":
+        return file_mode_matches(path, stat.S_ISSOCK)
+    if op == "-t":
+        try:
+            return os.isatty(int(value))
+        except (ValueError, OSError):
+            return False
+    if op == "-u":
+        return bool(file_mode(path) & stat.S_ISUID)
+    if op == "-v":
+        return shell.parameter_is_set(value)
+    if op == "-w":
+        return os.access(path, os.W_OK)
+    if op == "-x":
+        return os.access(path, os.X_OK)
+    return False
+
+
+def eval_double_bracket_binary(shell, left: str, op: str, right: str, right_quoted: bool) -> bool:
+    left_path = normalize_path_entry(left)
+    right_path = normalize_path_entry(right)
+    if op in {"=", "=="}:
+        return left == right if right_quoted else fnmatch.fnmatchcase(left, right)
+    if op == "!=":
+        return left != right if right_quoted else not fnmatch.fnmatchcase(left, right)
+    if op == "=~":
+        pattern = re.escape(right) if right_quoted else right
+        try:
+            return re.search(pattern, left) is not None
+        except re.error:
+            return False
+    if op == "<":
+        return left < right
+    if op == ">":
+        return left > right
+    if op in {"-eq", "-ne", "-gt", "-ge", "-lt", "-le"}:
+        try:
+            a = int(left, 10)
+            b = int(right, 10)
+        except ValueError:
+            return False
+        return {
+            "-eq": a == b,
+            "-ne": a != b,
+            "-gt": a > b,
+            "-ge": a >= b,
+            "-lt": a < b,
+            "-le": a <= b,
+        }[op]
+    if op == "-ef":
+        try:
+            return os.path.samefile(left_path, right_path)
+        except OSError:
+            return False
+    if not os.path.exists(left_path) or not os.path.exists(right_path):
+        return False
+    left_mtime = os.path.getmtime(left_path)
+    right_mtime = os.path.getmtime(right_path)
+    if op == "-nt":
+        return left_mtime > right_mtime
+    if op == "-ot":
+        return left_mtime < right_mtime
+    return False
+
+
+def file_mode(path: str) -> int:
+    try:
+        return os.lstat(path).st_mode
+    except OSError:
+        return 0
+
+
+def file_mode_matches(path: str, predicate: Callable[[int], bool]) -> bool:
+    mode = file_mode(path)
+    return bool(mode and predicate(mode))
+
+
+def path_owner_id(path: str) -> int | None:
+    try:
+        return os.stat(path).st_uid
+    except (AttributeError, OSError):
+        return None
+
+
+def path_group_id(path: str) -> int | None:
+    try:
+        return os.stat(path).st_gid
+    except (AttributeError, OSError):
+        return None
 
 
 def eval_test(args: list[str]) -> bool:
@@ -750,7 +1058,7 @@ def eval_test(args: list[str]) -> bool:
                 return False
     if len(args) == 3:
         left, op, right = args
-        if op == "=":
+        if op in {"=", "=="}:
             return left == right
         if op == "!=":
             return left != right
@@ -895,6 +1203,7 @@ BUILTINS: dict[str, Builtin] = {
     "times": builtin_times,
     "hash": builtin_hash,
     "history": builtin_history,
+    "local": builtin_local,
     "exit": builtin_exit,
     "return": builtin_return,
     "break": builtin_break,
@@ -912,4 +1221,5 @@ BUILTINS: dict[str, Builtin] = {
     "env": builtin_env,
     "test": builtin_test,
     "[": builtin_test,
+    "[[": builtin_test,
 }

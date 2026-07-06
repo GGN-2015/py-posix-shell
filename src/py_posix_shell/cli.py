@@ -25,12 +25,13 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    shell_path = sys.argv[0] or "pysh"
     if args.version:
         print(f"py-posix-shell {__version__}")
         return 0
 
     if args.command is not None:
-        shell = Shell(argv0="pysh", positional=args.args)
+        shell = Shell(argv0="pysh", shell_path=shell_path, positional=args.args)
         try:
             return shell.execute(args.command)
         except ShellExit as exc:
@@ -46,7 +47,7 @@ def main(argv: list[str] | None = None) -> int:
         except OSError as exc:
             print(f"pysh: {args.script}: {exc}", file=sys.stderr)
             return 1
-        shell = Shell(argv0=args.script, positional=args.args)
+        shell = Shell(argv0=args.script, shell_path=shell_path, positional=args.args)
         try:
             return shell.execute(source)
         except ShellExit as exc:
@@ -56,13 +57,16 @@ def main(argv: list[str] | None = None) -> int:
             return 130
 
     interactive = args.interactive or sys.stdin.isatty()
-    shell = Shell(argv0="pysh", interactive=interactive)
+    shell = Shell(argv0="pysh", shell_path=shell_path, interactive=interactive)
     if interactive:
         try:
+            shell.source_startup_file()
             return shell.repl()
         except KeyboardInterrupt:
             print(file=sys.stderr)
             return 130
+        except ShellExit as exc:
+            return exc.status
     try:
         return shell.execute(sys.stdin.read())
     except ShellExit as exc:

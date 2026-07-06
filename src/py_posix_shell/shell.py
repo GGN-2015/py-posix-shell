@@ -19,7 +19,7 @@ from typing import Iterator, TextIO
 
 from .builtins import BUILTINS, SPECIAL_BUILTINS
 from .errors import ExpansionError, LexerError, ParseError, ShellBreak, ShellContinue, ShellExit, ShellReturn
-from .expansion import chars_to_text, expand_assignment, expand_here_document, expand_redirection, expand_text, expand_word
+from .expansion import chars_to_text, expand_assignment, expand_here_document, expand_redirection, expand_text, expand_word, expand_word_to_chars
 from .lexer import Operator, Word, lex
 from .parser import (
     AndOrList,
@@ -46,6 +46,7 @@ class ExpandedCommand:
     assignments: dict[str, str]
     argv: list[str]
     redirections: list[tuple[int, str, str]]
+    conditional_quoted: tuple[bool, ...] = field(default_factory=tuple)
 
 
 @dataclass
@@ -113,6 +114,14 @@ class LineHistoryState:
     saved_line: str = ""
 
 
+@dataclass
+class LocalVariableSnapshot:
+    vars_present: bool
+    vars_value: str
+    env_present: bool
+    env_value: str
+
+
 class Shell:
     def __init__(
         self,
@@ -122,6 +131,7 @@ class Shell:
         stdout: TextIO | None = None,
         stderr: TextIO | None = None,
         argv0: str = "pysh",
+        shell_path: str | None = None,
         positional: list[str] | None = None,
         interactive: bool = False,
     ) -> None:
@@ -142,6 +152,8 @@ class Shell:
         self.traps: dict[str, str] = {}
         self.readonly: set[str] = set()
         self.command_hash: dict[str, str] = {}
+        self._local_scopes: list[dict[str, LocalVariableSnapshot]] = []
+        self._conditional_quoted: tuple[bool, ...] = ()
         self._alias_stack: set[str] = set()
         self._getopts_nextchar = 1
         self._execute_depth = 0
@@ -155,6 +167,8 @@ class Shell:
             home = os.path.expanduser("~")
             if home and home != "~":
                 self.env["HOME"] = home
+        if not self.env.get("SHELL"):
+            self.env["SHELL"] = resolve_shell_environment_value(shell_path or argv0, self.env)
 
     def clone(self, *, stdout: TextIO | None = None) -> "Shell":
         child = Shell(
@@ -163,6 +177,7 @@ class Shell:
             stdout=stdout if stdout is not None else self.stdout,
             stderr=self.stderr,
             argv0=self.argv0,
+            shell_path=self.env.get("SHELL"),
             positional=self.positional.copy(),
             interactive=False,
         )
@@ -174,6 +189,8 @@ class Shell:
         child.traps = self.traps.copy()
         child.readonly = self.readonly.copy()
         child.command_hash = self.command_hash.copy()
+        child._local_scopes = [scope.copy() for scope in self._local_scopes]
+        child._conditional_quoted = self._conditional_quoted
         child._alias_stack = self._alias_stack.copy()
         child._getopts_nextchar = self._getopts_nextchar
         child._execute_depth = self._execute_depth
@@ -183,6 +200,64 @@ class Shell:
         child._last_errexit_exempt = self._last_errexit_exempt
         child.last_status = self.last_status
         return child
+
+    def in_function(self) -> bool:
+        return bool(self._local_scopes)
+
+    def push_local_scope(self) -> None:
+        self._local_scopes.append({})
+
+    def pop_local_scope(self) -> None:
+        scope = self._local_scopes.pop()
+        for name, snapshot in reversed(scope.items()):
+            if snapshot.vars_present:
+                self.vars[name] = snapshot.vars_value
+            else:
+                self.vars.pop(name, None)
+            if snapshot.env_present:
+                self.env[name] = snapshot.env_value
+            else:
+                self.env.pop(name, None)
+
+    def declare_local_parameter(self, name: str, value: str | None = None, *, export: bool = False) -> None:
+        if not self._local_scopes:
+            raise ExpansionError("local: can only be used in a function")
+        scope = self._local_scopes[-1]
+        first_declaration = name not in scope
+        if first_declaration:
+            scope[name] = LocalVariableSnapshot(
+                name in self.vars,
+                self.vars.get(name, ""),
+                name in self.env,
+                self.env.get(name, ""),
+            )
+        if value is None:
+            if first_declaration:
+                self.set_parameter(name, "", export=export)
+            elif export:
+                self.set_parameter(name, self.get_parameter(name), export=True)
+            return
+        self.set_parameter(name, value, export=export)
+
+    def startup_file_path(self) -> Path:
+        return Path(self.get_parameter("HOME") or os.path.expanduser("~")) / ".pyshrc"
+
+    def source_startup_file(self) -> int:
+        path = self.startup_file_path()
+        if not path.exists():
+            return 0
+        try:
+            source = path.read_text(encoding="utf-8")
+        except OSError as exc:
+            self.stderr.write(f"{self.argv0}: {path}: {exc.strerror or exc}\n")
+            self.last_status = 1
+            return 1
+        try:
+            status = self.execute(source, allow_return=True)
+        except ShellReturn as exc:
+            status = exc.status
+            self.last_status = status
+        return status
 
     def execute(self, source: str, *, allow_return: bool = False) -> int:
         old_here_docs = self.here_docs
@@ -497,8 +572,15 @@ class Shell:
             assignments[name] = expand_assignment(self, word)
 
         argv: list[str] = []
+        conditional_quoted: list[bool] = []
+        is_conditional = bool(command.words and command.words[0].text == "[[" and not command.words[0].has_quoted_part)
         for word in command.words:
-            argv.extend(expand_word(self, word))
+            if is_conditional:
+                chars, _had_quoted = expand_word_to_chars(self, word)
+                argv.append(chars_to_text(chars))
+                conditional_quoted.append(word.has_quoted_part)
+            else:
+                argv.extend(expand_word(self, word))
 
         redirections: list[tuple[int, str, str]] = []
         for redir in command.redirections:
@@ -506,7 +588,7 @@ class Shell:
                 redirections.append((redir.fd, redir.op, self.pop_here_doc(redir.target.text)))
             else:
                 redirections.append((redir.fd, redir.op, expand_redirection(self, redir.target)))
-        return ExpandedCommand(assignments, argv, redirections)
+        return ExpandedCommand(assignments, argv, redirections, tuple(conditional_quoted))
 
     def expand_redirections(self, redirections: tuple[Redirection, ...]) -> list[tuple[int, str, str]]:
         expanded: list[tuple[int, str, str]] = []
@@ -553,6 +635,8 @@ class Shell:
 
         try:
             with self.redirected(expanded.redirections, stdin, stdout, self.stderr) as streams:
+                old_conditional_quoted = self._conditional_quoted
+                self._conditional_quoted = expanded.conditional_quoted
                 status = BUILTINS[name](self, expanded.argv, streams[0], streams[1], streams[2])
         except OSError as exc:
             self.stderr.write(f"{self.argv0}: {exc}\n")
@@ -561,6 +645,7 @@ class Shell:
             self.stderr.write(f"{self.argv0}: {exc}\n")
             status = 2
         finally:
+            self._conditional_quoted = old_conditional_quoted if "old_conditional_quoted" in locals() else ()
             for var_name, (was_set, old_value, was_exported) in restore.items():
                 if was_set:
                     self.set_parameter(var_name, old_value, export=was_exported)
@@ -674,6 +759,7 @@ class Shell:
         target.positional = expanded.argv[1:]
         target.argv0 = name
         redirections = target.expand_redirections(function.redirections) + expanded.redirections
+        target.push_local_scope()
 
         try:
             with target.redirected(redirections, stdin, stdout, target.stderr) as streams:
@@ -686,6 +772,7 @@ class Shell:
             self.stderr.write(f"{self.argv0}: {exc}\n")
             status = 1
         finally:
+            target.pop_local_scope()
             target.positional = old_positional
             target.argv0 = old_argv0
             for var_name, (was_set, old_value, was_exported) in restore.items():
@@ -1294,6 +1381,20 @@ def has_fileno(stream: TextIO) -> bool:
     except (AttributeError, OSError, io.UnsupportedOperation):
         return False
     return True
+
+
+def resolve_shell_environment_value(candidate: str, env: dict[str, str]) -> str:
+    candidate = candidate or "pysh"
+    native = normalize_path_entry(candidate)
+    if os.path.isabs(native) or any(sep in candidate for sep in ("/", "\\")):
+        return os.path.abspath(native)
+    matches = find_executable_matches(candidate, env)
+    if matches:
+        return matches[0]
+    found = shutil.which(candidate, path=env.get("PATH"))
+    if found:
+        return os.path.abspath(found)
+    return candidate
 
 
 def pipeline_input_stream(value: PipelineValue) -> TextIO:

@@ -305,6 +305,11 @@ class Parser:
                 redirections.append(Redirection(redir[0], redir[1], target))
                 continue
 
+            if isinstance(token, Word) and token.text == "[[" and not token.has_quoted_part and not seen_command_word:
+                seen_command_word = True
+                words.extend(self._parse_conditional_words())
+                continue
+
             self.pos += 1
             assignment = token.split_assignment()
             if assignment is not None and not seen_command_word:
@@ -317,6 +322,19 @@ class Parser:
             token = self._peek() if not self._at_end() else None
             raise ParseError(f"expected command, got {self._describe(token)}")
         return SimpleCommand(tuple(assignments), tuple(words), tuple(redirections))
+
+    def _parse_conditional_words(self) -> list[Word]:
+        words = [self._consume_word()]
+        while not self._at_end():
+            token = self._peek()
+            self.pos += 1
+            if isinstance(token, Word):
+                words.append(token)
+                if token.text == "]]" and not token.has_quoted_part:
+                    return words
+            else:
+                words.append(Word((Part(token.value),)))
+        raise ParseError("missing closing ]]")
 
     def _is_array_append_assignment(self, token: Word) -> bool:
         return (

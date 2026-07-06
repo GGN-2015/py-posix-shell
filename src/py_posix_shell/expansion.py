@@ -9,8 +9,8 @@ import os
 import re
 from dataclasses import dataclass
 
-from .errors import ExpansionError
-from .lexer import DOUBLE, PLAIN, SINGLE, Part, Word, is_name
+from .errors import ExpansionError, LexerError
+from .lexer import DOUBLE, PLAIN, SINGLE, Operator, Part, Word, is_name, lex
 
 
 @dataclass(frozen=True)
@@ -223,6 +223,19 @@ def split_parameter_body(body: str) -> tuple[str, str, str]:
 
 
 def expand_inline(shell, text: str, *, quoted: bool) -> str:
+    try:
+        tokens = lex(text)
+    except LexerError:
+        tokens = []
+    if tokens:
+        expanded: list[str] = []
+        for token in tokens:
+            if isinstance(token, Word):
+                chars, _had_quoted = expand_word_to_chars(shell, token)
+                expanded.append(chars_to_text(chars))
+            elif isinstance(token, Operator):
+                expanded.append(token.value)
+        return " ".join(expanded)
     return chars_to_text(expand_text(shell, text, quoted=quoted))
 
 
@@ -285,6 +298,16 @@ def read_command_substitution(text: str, start: int) -> tuple[str, int]:
             i += 1
             continue
         if quote:
+            if quote == '"' and char == "$" and i + 1 < len(text) and text[i + 1] == "(":
+                depth += 1
+                body.append("$(")
+                i += 2
+                continue
+            if quote == '"' and char == ")" and depth > 1:
+                depth -= 1
+                body.append(char)
+                i += 1
+                continue
             if char == quote:
                 quote = None
             body.append(char)
