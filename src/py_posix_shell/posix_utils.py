@@ -1152,22 +1152,30 @@ def utility_sleep(shell, argv: list[str], stdin: TextIO, stdout: TextIO, stderr:
     return 0
 
 
+def option_operands(args: list[str]) -> list[str]:
+    if args and args[0] == "--":
+        return args[1:]
+    return args
+
+
 def utility_basename(shell, argv: list[str], stdin: TextIO, stdout: TextIO, stderr: TextIO) -> int:
-    if len(argv) < 2:
+    args = option_operands(argv[1:])
+    if not args:
         stderr.write("basename: missing operand\n")
         return 2
-    name = os.path.basename(argv[1].rstrip("/\\"))
-    if len(argv) > 2 and name.endswith(argv[2]):
-        name = name[: -len(argv[2])]
+    name = os.path.basename(args[0].rstrip("/\\"))
+    if len(args) > 1 and name.endswith(args[1]):
+        name = name[: -len(args[1])]
     stdout.write(name + "\n")
     return 0
 
 
 def utility_dirname(shell, argv: list[str], stdin: TextIO, stdout: TextIO, stderr: TextIO) -> int:
-    if len(argv) < 2:
+    args = option_operands(argv[1:])
+    if not args:
         stderr.write("dirname: missing operand\n")
         return 2
-    dirname = os.path.dirname(argv[1].rstrip("/\\")) or "."
+    dirname = os.path.dirname(args[0].rstrip("/\\")) or "."
     stdout.write(dirname + "\n")
     return 0
 
@@ -1241,6 +1249,7 @@ def utility_grep(shell, argv: list[str], stdin: TextIO, stdout: TextIO, stderr: 
     quiet = False
     count_only = False
     list_files = False
+    whole_line = False
     with_filename: bool | None = None
     patterns: list[str] = []
     args: list[str] = []
@@ -1279,6 +1288,8 @@ def utility_grep(shell, argv: list[str], stdin: TextIO, stdout: TextIO, stderr: 
                     count_only = True
                 elif flag == "l":
                     list_files = True
+                elif flag == "x":
+                    whole_line = True
                 elif flag == "H":
                     with_filename = True
                 elif flag == "h":
@@ -1318,7 +1329,11 @@ def utility_grep(shell, argv: list[str], stdin: TextIO, stdout: TextIO, stderr: 
         haystack = line.lower() if ignore_case and fixed else line
         if fixed:
             needles = [pattern.lower() for pattern in patterns] if ignore_case else patterns
+            if whole_line:
+                return any(haystack == needle for needle in needles)
             return any(needle in haystack for needle in needles)
+        if whole_line:
+            return any(regex.fullmatch(line) is not None for regex in regexes)
         return any(regex.search(line) is not None for regex in regexes)
 
     matched_any = False
@@ -1424,26 +1439,39 @@ def utility_date(shell, argv: list[str], stdin: TextIO, stdout: TextIO, stderr: 
 
 def utility_uname(shell, argv: list[str], stdin: TextIO, stdout: TextIO, stderr: TextIO) -> int:
     flags = argv[1:] or ["-s"]
+    system_name, node_name, release_name, version_name, machine_name = uname_fields()
     if "-a" in flags:
-        values = [platform.system(), platform.node(), platform.release(), platform.version(), platform.machine()]
+        values = [system_name, node_name, release_name, version_name, machine_name]
     else:
         values = []
         for arg in flags:
             if arg == "-s":
-                values.append(platform.system())
+                values.append(system_name)
             elif arg == "-n":
-                values.append(platform.node())
+                values.append(node_name)
             elif arg == "-r":
-                values.append(platform.release())
+                values.append(release_name)
             elif arg == "-v":
-                values.append(platform.version())
+                values.append(version_name)
             elif arg == "-m":
-                values.append(platform.machine())
+                values.append(machine_name)
             else:
                 stderr.write(f"uname: invalid option: {arg}\n")
                 return 2
     stdout.write(" ".join(values) + "\n")
     return 0
+
+
+def uname_fields() -> tuple[str, str, str, str, str]:
+    node = platform.node()
+    release = platform.release()
+    version = platform.version()
+    machine = platform.machine()
+    if os.name == "nt":
+        win_release = version or release
+        system = f"MINGW64_NT-{win_release}" if win_release else "MINGW64_NT"
+        return system, node, win_release, version or release, machine or "x86_64"
+    return platform.system(), node, release, version, machine
 
 
 def utility_cygpath(shell, argv: list[str], stdin: TextIO, stdout: TextIO, stderr: TextIO) -> int:
@@ -2144,7 +2172,7 @@ def utility_sed(shell, argv: list[str], stdin: TextIO, stdout: TextIO, stderr: T
         return 2
     try:
         commands = [parse_sed_command(item) for script in scripts for item in split_sed_script(script)]
-    except ValueError as exc:
+    except (ValueError, re.error) as exc:
         stderr.write(f"sed: {exc}\n")
         return 2
 
@@ -2157,7 +2185,11 @@ def utility_sed(shell, argv: list[str], stdin: TextIO, stdout: TextIO, stderr: T
         if text is None:
             status = 1
             continue
-        output = run_sed_program(text, commands, suppress_default)
+        try:
+            output = run_sed_program(text, commands, suppress_default)
+        except re.error as exc:
+            stderr.write(f"sed: {exc}\n")
+            return 2
         if in_place is not None and path != "-":
             file_path = Path(path)
             if in_place:
@@ -3568,7 +3600,7 @@ def parse_sed_command(command: str) -> SedCommand:
         index += 1
     elif index < len(text) and text[index] == "/":
         pattern, index = read_until_unescaped(text, index + 1, "/")
-        address = ("regex", re.compile(pattern))
+        address = ("regex", re.compile(translate_sed_basic_regex(pattern)))
     while index < len(text) and text[index].isspace():
         index += 1
     if index >= len(text):
@@ -3582,7 +3614,7 @@ def parse_sed_command(command: str) -> SedCommand:
         pattern, index = read_until_unescaped(text, index + 1, delimiter)
         replacement, index = read_until_unescaped(text, index, delimiter)
         flags = text[index:].strip()
-        return SedCommand(address, "s", pattern, normalize_sed_replacement(replacement), flags)
+        return SedCommand(address, "s", translate_sed_basic_regex(pattern), normalize_sed_replacement(replacement), flags)
     if op in {"p", "d", "q"}:
         return SedCommand(address, op)
     raise ValueError(f"unsupported command: {op}")
@@ -3604,6 +3636,69 @@ def normalize_sed_replacement(replacement: str) -> str:
     if escaped:
         result.append("\\")
     return "".join(result)
+
+
+POSIX_REGEX_CLASSES = {
+    "alnum": "A-Za-z0-9",
+    "alpha": "A-Za-z",
+    "blank": r" \t",
+    "cntrl": r"\x00-\x1f\x7f",
+    "digit": r"\d",
+    "graph": r"\x21-\x7e",
+    "lower": "a-z",
+    "print": r"\x20-\x7e",
+    "punct": r"""!"\#\$%&'\(\)\*\+,\-./:;<=>\?@\[\\\]\^_`\{\|\}\~""",
+    "space": r"\s",
+    "upper": "A-Z",
+    "xdigit": "A-Fa-f0-9",
+}
+
+
+def translate_sed_basic_regex(pattern: str) -> str:
+    pattern = translate_posix_regex_classes(pattern)
+    result: list[str] = []
+    index = 0
+    in_bracket = False
+    bracket_start = False
+    while index < len(pattern):
+        char = pattern[index]
+        if in_bracket:
+            result.append(char)
+            if char == "]" and not bracket_start:
+                in_bracket = False
+            bracket_start = False
+            index += 1
+            continue
+        if char == "[":
+            result.append(char)
+            in_bracket = True
+            bracket_start = True
+            index += 1
+            continue
+        if char == "\\" and index + 1 < len(pattern):
+            nxt = pattern[index + 1]
+            if nxt in {"(", ")", "{", "}", "+", "?", "|"}:
+                result.append(nxt)
+            elif nxt == "/":
+                result.append("/")
+            else:
+                result.append("\\" + nxt)
+            index += 2
+            continue
+        if char in {"(", ")", "{", "}", "+", "?", "|"}:
+            result.append("\\" + char)
+        else:
+            result.append(char)
+        index += 1
+    return "".join(result)
+
+
+def translate_posix_regex_classes(pattern: str) -> str:
+    def replace(match: re.Match[str]) -> str:
+        name = match.group(1)
+        return POSIX_REGEX_CLASSES.get(name, match.group(0))
+
+    return re.sub(r"\[:([A-Za-z]+):\]", replace, pattern)
 
 
 def sed_address_matches(address: tuple[str, Any] | None, line: str, number: int, total: int) -> bool:
@@ -5524,7 +5619,7 @@ HELP_ITEMS: tuple[tuple[str, str, str], ...] = (
     ("df", "df [-hkmPT] [file ...]", "Report filesystem disk space usage."),
     ("diff", "diff [-u] file1 file2", "Compare files line by line."),
     ("find", "find [path ...] [expression]", "Walk file trees and match paths."),
-    ("grep", "grep [-EinvcqFlHh] pattern [file ...]", "Search files for matching lines."),
+    ("grep", "grep [-EinvcqxFlHh] pattern [file ...]", "Search files for matching lines."),
     ("install", "install [-D] [-d] [-m mode] source target", "Copy files and set attributes."),
     ("ls", "ls [-Aald1] [file ...]", "List directory contents."),
     ("lsblk", "lsblk [-bdfin] [-o columns]", "List block devices and mounted filesystems."),

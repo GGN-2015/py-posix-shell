@@ -323,6 +323,7 @@ class Shell:
         self._last_errexit_exempt = False
         with self.suppress_errexit():
             status = self.execute_pipeline(item.first)
+        self.last_status = status
         executed_last = not item.rest
         for index, (op, pipeline) in enumerate(item.rest):
             if op == "&&" and status != 0:
@@ -338,6 +339,7 @@ class Shell:
             else:
                 with self.suppress_errexit():
                     status = self.execute_pipeline(pipeline)
+            self.last_status = status
         self._last_errexit_exempt = bool(item.rest and not executed_last)
         self.last_status = status
         return status

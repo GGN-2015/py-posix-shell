@@ -270,10 +270,19 @@ def builtin_pwd(shell, argv: list[str], stdin: TextIO, stdout: TextIO, stderr: T
 
 
 def builtin_cd(shell, argv: list[str], stdin: TextIO, stdout: TextIO, stderr: TextIO) -> int:
-    if len(argv) > 2:
+    args = argv[1:]
+    while args:
+        if args[0] == "--":
+            args = args[1:]
+            break
+        if args[0] in {"-L", "-P"}:
+            args = args[1:]
+            continue
+        break
+    if len(args) > 1:
         stderr.write("cd: too many arguments\n")
         return 2
-    target = argv[1] if len(argv) == 2 else shell.get_parameter("HOME")
+    target = args[0] if args else shell.get_parameter("HOME")
     if not target:
         stderr.write("cd: HOME not set\n")
         return 1
@@ -649,9 +658,18 @@ def builtin_printf(shell, argv: list[str], stdin: TextIO, stdout: TextIO, stderr
 def builtin_read(shell, argv: list[str], stdin: TextIO, stdout: TextIO, stderr: TextIO) -> int:
     args = argv[1:]
     raw = False
-    if args and args[0] == "-r":
-        raw = True
-        args = args[1:]
+    while args:
+        if args[0] == "--":
+            args = args[1:]
+            break
+        if args[0] == "-r":
+            raw = True
+            args = args[1:]
+            continue
+        if args[0].startswith("-") and args[0] != "-":
+            stderr.write(f"read: invalid option: {args[0]}\n")
+            return 2
+        break
     if not args:
         args = ["REPLY"]
     line = stdin.readline()
@@ -659,18 +677,57 @@ def builtin_read(shell, argv: list[str], stdin: TextIO, stdout: TextIO, stderr: 
         return 1
     line = line.rstrip("\n")
     if not raw:
-        line = line.replace("\\\n", "")
-    values = line.split()
+        line = decode_read_escapes(line)
+    values = split_read_fields(line, args, shell.get_parameter("IFS"))
     for index, name in enumerate(args):
         if not is_name(name):
             stderr.write(f"read: {name}: not a valid identifier\n")
             return 2
-        if index == len(args) - 1:
-            value = " ".join(values[index:])
-        else:
-            value = values[index] if index < len(values) else ""
-        shell.set_parameter(name, value)
+        shell.set_parameter(name, values[index] if index < len(values) else "")
     return 0
+
+
+def decode_read_escapes(line: str) -> str:
+    result: list[str] = []
+    escaped = False
+    for char in line:
+        if escaped:
+            result.append(char)
+            escaped = False
+        elif char == "\\":
+            escaped = True
+        else:
+            result.append(char)
+    if escaped:
+        result.append("\\")
+    return "".join(result)
+
+
+def split_read_fields(line: str, names: list[str], ifs: str) -> list[str]:
+    if ifs == "":
+        return [line] + [""] * (len(names) - 1)
+    if not names:
+        return []
+    ifs_whitespace = "".join(char for char in ifs if char.isspace())
+    ifs_chars = set(ifs)
+    text = line.strip(ifs_whitespace)
+    if len(names) == 1:
+        return [text]
+
+    values: list[str] = []
+    index = 0
+    length = len(text)
+    for _name in names[:-1]:
+        while index < length and text[index] in ifs_chars:
+            index += 1
+        start = index
+        while index < length and text[index] not in ifs_chars:
+            index += 1
+        values.append(text[start:index])
+        while index < length and text[index] in ifs_chars:
+            index += 1
+    values.append(text[index:].rstrip(ifs_whitespace))
+    return values
 
 
 def builtin_type(shell, argv: list[str], stdin: TextIO, stdout: TextIO, stderr: TextIO) -> int:

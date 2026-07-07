@@ -136,6 +136,14 @@ def test_and_or_status():
     assert stdout == "yes\n"
 
 
+def test_and_or_updates_status_before_expanding_next_command():
+    status, stdout, stderr, _shell = run_shell('false || echo "or:$?"; true && echo "and:$?"')
+
+    assert status == 0
+    assert stdout == "or:1\nand:0\n"
+    assert stderr == ""
+
+
 def test_redirection(tmp_path):
     path = tmp_path / "out.txt"
     status, stdout, stderr, _shell = run_shell(f'echo saved > "{path}"')
@@ -832,6 +840,22 @@ def test_internal_process_and_identity_utilities_without_path():
     assert stderr == ""
 
 
+def test_windows_uname_fallback_matches_msys_style(monkeypatch):
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    monkeypatch.setattr(posix_utils.os, "name", "nt")
+    monkeypatch.setattr(posix_utils.platform, "node", lambda: "host")
+    monkeypatch.setattr(posix_utils.platform, "release", lambda: "11")
+    monkeypatch.setattr(posix_utils.platform, "version", lambda: "10.0.26100")
+    monkeypatch.setattr(posix_utils.platform, "machine", lambda: "AMD64")
+
+    status = posix_utils.utility_uname(None, ["uname", "-s"], io.StringIO(), stdout, stderr)
+
+    assert status == 0
+    assert stdout.getvalue() == "MINGW64_NT-10.0.26100\n"
+    assert stderr.getvalue() == ""
+
+
 def test_windows_ps_formats_linux_style_process_views(monkeypatch):
     now = dt.datetime.now()
     current_pid = os.getpid()
@@ -1506,6 +1530,49 @@ yes ok | head -n 2
     assert "ALPHA\nALPHA\n" in stdout
     assert stdout.endswith("ok\nok\n")
     assert stderr == ""
+
+
+def test_package_script_posix_idioms_supported_without_path(tmp_path):
+    script_path = tmp_path / "package.sh"
+    seen = tmp_path / "seen.txt"
+    script = f'''
+set -eu
+script_dir="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+printf 'script:%s\\n' "$script_dir"
+printf 'foo\\nfoobar\\n' > "{seen}"
+grep -Fqx foo "{seen}"
+printf 'grep-exact:%s\\n' "$?"
+if grep -Fqx oo "{seen}"; then
+  printf 'grep-partial:bad\\n'
+else
+  printf 'grep-partial:1\\n'
+fi
+printf 'DLL Name: foo.dll\\n' | sed -n 's/.*DLL Name:[[:space:]]*//p'
+printf 'x => /tmp/libx.so (0x1)\\n' | sed -n -e 's/.*=>[[:space:]]*\\(\\/[^ ]*\\).*/\\1/p'
+printf '  keep  spaces  \\n' | while IFS= read -r dep_spec; do printf '<%s>\\n' "$dep_spec"; done
+printf 'base:%s\\n' "$(basename -- "$0")"
+printf 'dir:%s\\n' "$(dirname -- "$0")"
+'''
+    script_path.write_text(script, encoding="utf-8")
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    shell = Shell(argv0=str(script_path), stdout=stdout, stderr=stderr, env={"PATH": ""})
+
+    status = shell.execute(script)
+
+    assert status == 0
+    lines = stdout.getvalue().splitlines()
+    assert os.path.normcase(lines[0]) == os.path.normcase(f"script:{tmp_path}")
+    assert lines[1:] == [
+        "grep-exact:0",
+        "grep-partial:1",
+        "foo.dll",
+        "/tmp/libx.so",
+        "<  keep  spaces  >",
+        "base:package.sh",
+        f"dir:{tmp_path}",
+    ]
+    assert stderr.getvalue() == ""
 
 
 def test_internal_clear_utility_without_path():
