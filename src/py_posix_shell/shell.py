@@ -1191,16 +1191,48 @@ class Shell:
         if state.index == history_end:
             state.saved_line = line
         if direction < 0:
-            if state.index == 0:
+            target = self.previous_visible_history_index(state.index)
+            if target is None:
                 return line, False
-            state.index -= 1
+            state.index = target
             return self.history_entry_for_input(self.history[state.index]), True
         if state.index >= history_end:
             return line, False
-        state.index += 1
+        state.index = self.next_visible_history_index(state.index)
         if state.index == history_end:
             return state.saved_line, True
         return self.history_entry_for_input(self.history[state.index]), True
+
+    def previous_visible_history_index(self, index: int) -> int | None:
+        history_end = len(self.history)
+        if index <= 0:
+            return None
+        if index >= history_end:
+            target = history_end - 1
+        else:
+            current_key = self.history[index].strip()
+            target = index - 1
+            while target >= 0 and self.history[target].strip() == current_key:
+                target -= 1
+            if target < 0:
+                return None
+        while target > 0 and self.history[target - 1].strip() == self.history[target].strip():
+            target -= 1
+        return target
+
+    def next_visible_history_index(self, index: int) -> int:
+        history_end = len(self.history)
+        if index >= history_end:
+            return history_end
+        current_key = self.history[index].strip()
+        target = index + 1
+        while target < history_end and self.history[target].strip() == current_key:
+            target += 1
+        if target >= history_end:
+            return history_end
+        while target + 1 < history_end and self.history[target + 1].strip() == self.history[target].strip():
+            target += 1
+        return target
 
     def history_entry_for_input(self, entry: str) -> str:
         return " ".join(entry.splitlines())

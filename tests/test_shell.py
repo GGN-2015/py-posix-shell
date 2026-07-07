@@ -72,6 +72,7 @@ def test_cli_sets_shell_to_pysh_entry_when_running_script(monkeypatch, tmp_path,
     script = tmp_path / "show-shell.pysh"
     script.write_text('printf "%s\\n%s\\n" "$0" "$SHELL"\n', encoding="utf-8")
     pysh_path = tmp_path / ("pysh.exe" if os.name == "nt" else "pysh")
+    monkeypatch.delenv("SHELL", raising=False)
     monkeypatch.setattr(sys, "argv", [str(pysh_path), str(script)])
 
     status = cli.main([str(script)])
@@ -1264,6 +1265,50 @@ def test_apply_history_navigation_redraws_line_and_beeps_at_edges():
     assert "\r$ much longer command" in output
     assert "\r$ short" in output
     assert output.endswith("\a")
+
+
+def test_input_history_navigation_skips_adjacent_strip_duplicates():
+    stdout = io.StringIO()
+    shell = Shell(stdout=stdout, stderr=io.StringIO())
+    shell.history = [
+        "echo one",
+        "echo two",
+        "  echo two  ",
+        "echo three",
+        "echo three   ",
+    ]
+    state = LineHistoryState(index=len(shell.history))
+
+    line = shell.apply_history_navigation("$ ", "draft", state, -1)
+    assert line == "echo three"
+    assert state.index == 3
+
+    line = shell.apply_history_navigation("$ ", line, state, -1)
+    assert line == "echo two"
+    assert state.index == 1
+
+    line = shell.apply_history_navigation("$ ", line, state, -1)
+    assert line == "echo one"
+    assert state.index == 0
+
+    line = shell.apply_history_navigation("$ ", line, state, -1)
+    assert line == "echo one"
+    assert state.index == 0
+
+    line = shell.apply_history_navigation("$ ", line, state, 1)
+    assert line == "  echo two  "
+    assert state.index == 2
+
+    line = shell.apply_history_navigation("$ ", line, state, 1)
+    assert line == "echo three   "
+    assert state.index == 4
+
+    line = shell.apply_history_navigation("$ ", line, state, 1)
+    assert line == "draft"
+    assert state.index == len(shell.history)
+
+    output = stdout.getvalue()
+    assert output.count("\a") == 1
 
 
 def test_input_backspace_erases_wide_character_cells():
